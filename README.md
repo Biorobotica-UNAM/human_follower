@@ -1,5 +1,4 @@
 # human_follower
-# human_follower
 
 `human_follower` is a ROS 2 package that makes a mobile robot follow a person using the estimated leg position provided by a leg-detection node (e.g., `leg_finder`).  
 The node subscribes to the detected leg pose, computes proportional control, and publishes velocity commands to `/cmd_vel`.
@@ -29,7 +28,7 @@ Make sure the following are installed and sourced:
 ## Build
 
 ```bash
-cd ~/human_follower/catkin_ws
+cd ~/catkin_ws
 colcon build --packages-select human_follower
 source install/setup.bash
 ```
