@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<launch>
+
+  <node pkg="urg_node" exec="urg_node_driver" name="hokuyo_laser" output="screen">
+    <param name="serial_port" value="/dev/ttyACM0"/>
+    <param name="serial_baud" value="115200"/>
+    <param name="laser_frame_id" value="laser_link"/>
+
+    <param name="angle_min" value="-2.094"/>
+    <param name="angle_max" value="2.094"/>
+    <param name="cluster" value="1"/>
+    <param name="skip" value="0"/>
+
+    <param name="publish_intensity" value="false"/>
+    <param name="publish_multiecho" value="false"/>
+
+    <param name="range_min" value="0.02"/>
+    <param name="range_max" value="4.0"/>
+
+    <param name="calibrate_time" value="false"/>
+    <param name="synchronize_time" value="false"/>
+    <param name="time_offset" value="0.0"/>
+  </node>
+
+</launch>

@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<launch>
+
+  <include file="$(find-pkg-share justina_description)/launch/display.launch.xml"/>
+
+  <!-- <include file="$(find-pkg-share human_follower)/launch/hokuyo_usb.launch.xml"/> -->
+
+  <!-- Leg finder node -->
+
+  <node pkg="human_follower" exec="leg_finder_node" name="leg_finder_node" output="screen">
+    <param name="laser_scan_topic" value="/hardware/base/scan"/>
+    <param name="laser_scan_frame" value="laser_link"/>
+    <param name="frame_id" value="base_link"/>
+    <param name="show_hypothesis" value="true"/>
+    <param name="scan_downsample" value="1"/>
+  </node>
+
+  <!-- Human follower node -->
+
+  <node pkg="human_follower" exec="human_follower_node" name="human_follower_node" output="screen">
+    <param name="control_alpha" value="0.6548"/>
+    <param name="control_beta" value="0.3"/>
+    <param name="max_linear" value="0.3"/>
+    <param name="max_angular" value="0.7"/>
+    <param name="distance_to_human" value="0.9"/>
+    <param name="move_backwards" value="false"/>
+    <param name="enable_potfields" value="false"/>
+    <param name="cmd_vel_topic" value="/hardware/base/cmd_vel"/>
+  </node>
+
+  <!-- Pipeline handler node -->
+  <node pkg="human_follower" exec="human_tracking_node" name="human_tracking_node" output="screen"/>
+
+
+</launch>
