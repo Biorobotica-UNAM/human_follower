@@ -1,3 +1,0 @@
-[submodule "catkin_ws/src/justina_description"]
-	path = catkin_ws/src/justina_description
-	url = git@github.com:Biorobotica-UNAM/justina_description.git
