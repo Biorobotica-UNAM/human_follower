@@ -50,18 +50,10 @@ ament_target_dependencies(human_tracking_node
   std_srvs
 )
 
-install(
-  TARGETS human_follower_node
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS leg_finder_node 
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS human_tracking_node 
+install(TARGETS 
+  human_follower_node
+  leg_finder_node
+  human_tracking_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -17,7 +17,7 @@ class HumanFollower : public rclcpp::Node
 {
 public:
     HumanFollower()
-    : Node("human_follower"), enable_(false), new_legs_pose_(false)
+    : Node("human_follower"), enable_(false)
     {
         RCLCPP_INFO(this->get_logger(), "INITIALIZING HUMAN FOLLOWER NODE...");
 
@@ -37,13 +37,20 @@ public:
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Pub/Sub
-        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 1);
+        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
+            rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliability(rclcpp::ReliabilityPolicy::Reliable)
+            .durability(rclcpp::DurabilityPolicy::TransientLocal));
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/human_following/enable", 1,
             std::bind(&HumanFollower::callback_enable, this, std::placeholders::_1));
         sub_stop_ = this->create_subscription<std_msgs::msg::Empty>(
             "/stop", 1,
             std::bind(&HumanFollower::callback_stop, this, std::placeholders::_1));
+
+        control_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(30),
+            std::bind(&HumanFollower::control_loop, this));
 
         RCLCPP_INFO(this->get_logger(), 
             "max_linear=%.2f max_angular=%.2f alpha=%.2f beta=%.2f",
@@ -53,37 +60,11 @@ public:
             cmd_vel_topic_.c_str(), legs_pose_topic_.c_str());
     }
 
-    void run()
-    {
-        rclcpp::Rate rate(30); // 30 Hz
-        int no_legs = 0;
-
-        while (rclcpp::ok())
-        {
-            if (enable_)
-            {
-                if (new_legs_pose_)
-                    no_legs = 0;
-                else
-                {
-                    if (++no_legs > 30)
-                    {
-                        no_legs = 0;
-                        geometry_msgs::msg::Twist cmd;
-                        cmd.linear.x = 0.0;
-                        cmd.angular.z = 0.0;
-                        pub_cmd_vel_->publish(cmd);
-                    }
-                }
-                new_legs_pose_ = false;
-            }
-
-            rclcpp::spin_some(shared_from_this());
-            rate.sleep();
-        }
-    }
-
 private:
+
+    // Timers
+    rclcpp::TimerBase::SharedPtr control_timer_;
+
     // Subs / pubs
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
@@ -100,12 +81,18 @@ private:
     std::string legs_pose_topic_, cmd_vel_topic_;
 
     // Estado interno
-    bool enable_, new_legs_pose_;
-
+    bool enable_;
+    
     // Potenciales
     float repulsiveForce_ = 0.0f;
     float KInfRep_ = 0.03f;
-
+    
+    // Follower state
+    float human_x_ = 0.0f;
+    float human_y_ = 0.0f;
+    bool have_target_ = false;
+    int no_legs_ = 0;
+    
     // --- Callbacks ---
     void callback_enable(const std_msgs::msg::Bool::SharedPtr msg)
     {
@@ -133,21 +120,21 @@ private:
 
     void callback_legs_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg)
     {
-        float human_x = msg->point.x;
-        float human_y = msg->point.y;
+        float x = msg->point.x;
+        float y = msg->point.y;
 
         if (msg->header.frame_id != "base_link")
         {
             try {
-                transform_to_robot_position(human_x, human_y, msg->header.frame_id, human_x, human_y);
+                transform_to_robot_position(x, y, msg->header.frame_id, x, y);
             } catch (const tf2::TransformException &ex) {
                 RCLCPP_WARN(this->get_logger(), "TF2 error: %s", ex.what());
                 return;
             }
         }
-
-        pub_cmd_vel_->publish(calculate_speeds(human_x, human_y));
-        new_legs_pose_ = true;
+        human_x_ = x;
+        human_y_ = y;
+        have_target_ = true;
     }
 
     geometry_msgs::msg::Twist calculate_speeds(float goal_x, float goal_y)
@@ -189,6 +176,30 @@ private:
         x_wrt_robot = v.x();
         y_wrt_robot = v.y();
     }
+
+    void control_loop(){
+        if (!enable_) return;
+
+        if (have_target_)
+        {
+            no_legs_ = 0;
+            geometry_msgs::msg::Twist cmd = calculate_speeds(human_x_, human_y_);
+            pub_cmd_vel_->publish(cmd);
+            have_target_ = false;
+        }
+
+        else
+        {
+            if (++no_legs_ > 30)
+            {
+                no_legs_ = 0;
+                geometry_msgs::msg::Twist stop_cmd;
+                stop_cmd.linear.x = 0.0;
+                stop_cmd.angular.z = 0.0;
+                pub_cmd_vel_->publish(stop_cmd);
+            }
+        }
+    }
 };
 
 // --- main ---
@@ -196,7 +207,7 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<HumanFollower>();
-    node->run();
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }

@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
 
-  <include file="$(find-pkg-share justina_description)/launch/display.launch.xml"/>
+  <!--<include file="$(find-pkg-share justina_description)/launch/display.launch.xml"/>-->
 
   <!-- <include file="$(find-pkg-share human_follower)/launch/hokuyo_usb.launch.xml"/> -->
 
