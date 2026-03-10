@@ -322,11 +322,11 @@ private:
         const std::vector<float>& laser_y)
     {
         std::vector<Flank> flanks;
-        int ant2 = 0;
+        size_t ant2 = 0;
 
-        for (int i = 1; i < (int)laser->ranges.size(); i++)
+        for (size_t i = 1; i < laser->ranges.size(); i++)
         {
-            int ant = ant2;
+            size_t ant = ant2;
 
             if (fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD)
                 ant2 = i;
@@ -340,7 +340,7 @@ private:
                 float dist2 = dx*dx + dy*dy;
 
                 float sum_x = 0, sum_y = 0;
-                for (int j = ant; j < i; j++)
+                for (size_t j = ant; j < i; j++)
                 {
                     sum_x += laser_x[j];
                     sum_y += laser_y[j];
@@ -367,9 +367,9 @@ private:
                         std::vector<float>& legs_x,
                         std::vector<float>& legs_y)
     {
-        for (int i = 0; i < (int)flanks.size() - 1; i++)
+        for (size_t i = 0; i < flanks.size() - 1; i++)
         {
-            for (int j = i + 1; j < (int)flanks.size(); j++)
+            for (size_t j = i + 1; j < flanks.size(); j++)
             {
                 if (flanks[i].used || flanks[j].used)
                     continue;
