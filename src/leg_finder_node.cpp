@@ -431,7 +431,7 @@ private:
         nearest_x = MAX_FLOAT;
         nearest_y = MAX_FLOAT;
         float min_dist = MAX_FLOAT;
-        for(int i=0; i < legs_x.size(); i++)
+        for(size_t i=0; i < legs_x.size(); i++)
         {
             if(!(legs_x[i] > IN_FRONT_MIN_X && legs_x[i] < IN_FRONT_MAX_X && legs_y[i] > IN_FRONT_MIN_Y && legs_y[i] < IN_FRONT_MAX_Y))
                 continue;
@@ -452,7 +452,7 @@ private:
         nearest_x = MAX_FLOAT;
         nearest_y = MAX_FLOAT;
         float min_dist = MAX_FLOAT;
-        for(int i=0; i < legs_x.size(); i++)
+        for(size_t i=0; i < legs_x.size(); i++)
         {
             float dist = sqrt((legs_x[i] - last_x)*(legs_x[i] - last_x) + (legs_y[i] - last_y)*(legs_y[i] - last_y));
             if(dist < min_dist)
@@ -474,8 +474,7 @@ private:
             last_legs_pose_x_ = nearest_x;
             last_legs_pose_y_ = nearest_y;
             // Inicializar filtros
-            for (int i 
-                = 0; i < 4; i++) {
+            for (size_t i = 0; i < 4; i++) {
                 legs_x_filter_input_[i] = nearest_x;
                 legs_x_filter_output_[i] = nearest_x;
                 legs_y_filter_input_[i] = nearest_y;
