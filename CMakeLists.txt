@@ -19,6 +19,7 @@ find_package(urg_node REQUIRED)
 
 
 add_executable(leg_finder_node src/leg_finder_node.cpp)
+add_executable(human_follower_nodeV2 src/human_follower_nodeV2.cpp)
 add_executable(human_follower_node src/human_follower_node.cpp)
 add_executable(human_tracking_node src/human_tracking_node.cpp)
 
@@ -44,6 +45,17 @@ ament_target_dependencies(human_follower_node
   Eigen3
 )
 
+ament_target_dependencies(human_follower_nodeV2
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  visualization_msgs
+  tf2_ros
+  tf2_eigen
+  Eigen3
+)
+
 ament_target_dependencies(human_tracking_node
   rclcpp
   std_msgs
@@ -54,6 +66,7 @@ install(TARGETS
   human_follower_node
   leg_finder_node
   human_tracking_node
+  human_follower_nodeV2
   DESTINATION lib/${PROJECT_NAME}
 )
 
