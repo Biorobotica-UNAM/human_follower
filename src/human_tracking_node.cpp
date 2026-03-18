@@ -10,18 +10,13 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "INITIALIZING HUMAN TRACKING NODE...");
 
-        // topics
-
         // Subs / pubs
         pub_hf_enable_ = this->create_publisher<std_msgs::msg::Bool>("/hri/human_following/enable", 1);
         pub_lf_enable_ =this->create_publisher<std_msgs::msg::Bool>("/hri/leg_finder/enable", 1);
-<<<<<<< HEAD
         
         pub_person_tracker_enable_ = this->create_publisher<std_msgs::msg::Bool>("/person_tracker/enable", 1);
         pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
-=======
         pub_yd_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
->>>>>>> c3d7d75 (human_follower tracker changuesx2)
 
         // Services
         human_tracking_srv_ = this->create_service<std_srvs::srv::SetBool>(
@@ -33,12 +28,9 @@ public:
         // Subs / pubs
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_hf_enable_;
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_lf_enable_;
-<<<<<<< HEAD
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_person_tracker_enable_;
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_human_detection_enable_;
-=======
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_yd_enable_;
->>>>>>> c3d7d75 (human_follower tracker changuesx2)
         rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr human_tracking_srv_;
 
         bool enable_ = false;
@@ -52,12 +44,9 @@ public:
             msg.data = enable_;
             pub_hf_enable_->publish(msg);
             pub_lf_enable_->publish(msg);
-<<<<<<< HEAD
             pub_person_tracker_enable_->publish(msg);
             pub_human_detection_enable_->publish(msg);
-=======
             pub_yd_enable_->publish(msg);
->>>>>>> c3d7d75 (human_follower tracker changuesx2)
 
             response->success = true;
             if (enable_)                                
