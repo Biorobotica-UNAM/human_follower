@@ -40,8 +40,14 @@ public:
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Publishers
-        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
-        pub_debug_point_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/human_follower/target_debug", 10);
+         pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
+            rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliability(rclcpp::ReliabilityPolicy::Reliable)
+            .durability(rclcpp::DurabilityPolicy::TransientLocal));
+        pub_debug_point_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/human_follower/target_debug", 
+            rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliability(rclcpp::ReliabilityPolicy::Reliable)
+            .durability(rclcpp::DurabilityPolicy::TransientLocal));
         
         // Subscriptions
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
@@ -88,7 +94,7 @@ private:
 
     // Constantes de Fusión
     const float MAX_STD_DEV = 0.6;    //distancia maxima aceptable legs/body
-    const float MAX_AGE_MS = 600.0;   // tiempo maximo de validez de un mensaje
+    const float MAX_AGE_MS = 500.0;   // tiempo maximo de validez de un mensaje
     const float LEG_WEIGHT = 0.6;     //influencia de las piernas 
     const float BODY_WEIGHT = 0.4;    //influencia del cuerpo
 
@@ -100,13 +106,20 @@ private:
             sub_legs_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
                 legs_pose_topic_, 1,
                 std::bind(&HumanFollower::callback_legs_pose, this, std::placeholders::_1));
+            sub_body_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+                person_pose_topic_, 1,
+                std::bind(&HumanFollower::callback_body_pose, this, std::placeholders::_1));
         } else {
             RCLCPP_INFO(this->get_logger(), "SYSTEM DISABLED");
             sub_legs_pose_.reset();
+            sub_body_pose_.reset();
         }
     }
 
     void callback_stop(const std_msgs::msg::Empty::SharedPtr) {
+
+        sub_legs_pose_.reset();
+        sub_body_pose_.reset();
         enable_ = false;
         RCLCPP_WARN(this->get_logger(), "STOP RECEIVED");
     }
@@ -197,17 +210,28 @@ private:
 
     geometry_msgs::msg::Twist calculate_speeds(float gx, float gy) {
         float angle_error = atan2(gy, gx);
-        float dist = sqrt(gx*gx + gy*gy) - dist_to_human_;
+        float dist = sqrt(gx*gx + gy*gy);
+        dist -= dist_to_human_;
         
         if (!move_backwards_ && dist < 0) dist = 0;
         if (dist > max_linear_) dist = max_linear_;
 
-        geometry_msgs::msg::Twist res;
+        geometry_msgs::msg::Twist result;
         if (dist > 0 || (move_backwards_ && std::abs(dist) > 0.05)) {
-            res.linear.x = dist * exp(-(angle_error * angle_error) / control_alpha_);
-            res.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
+            result.linear.x = dist * exp(-(angle_error * angle_error) / control_alpha_);
+            result.linear.y = 0;
+            if (use_potfields_) result.linear.y = KInfRep_ * repulsiveForce_;
+            result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
         }
-        return res;
+        else {
+            result.linear.x = 0;
+            result.linear.y = 0;
+            if (fabs(angle_error) >= M_PI_4 / 6.0f)
+                result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
+            else
+                result.angular.z = 0;
+        }
+        return result;
     }
 };
 
