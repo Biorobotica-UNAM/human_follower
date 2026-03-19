@@ -16,12 +16,6 @@
     <param name="scan_downsample" value="1"/>
   </node>
 
- <!-- person tracker node -->
-  <node pkg="human_detection" exec="person_tracker" name="person_tracker_node" output="screen">
-    <param name="use_yolo" value="true"/>
-    <param name="yolo_topic" value="/human_detection/target_point"/>
-    </node>
-
   <!-- Human follower node -->
 
   <node pkg="human_follower" exec="human_follower_nodeV2" name="human_follower_nodeV2" output="screen">
@@ -33,6 +27,7 @@
     <param name="move_backwards" value="false"/>
     <param name="enable_potfields" value="false"/>
     <param name="cmd_vel_topic" value="/hardware/base/cmd_vel"/>
+    <param name="person_pose_topic" value="/hardware/head/look_at"/>
   </node>
 
   <!-- Pipeline handler node -->

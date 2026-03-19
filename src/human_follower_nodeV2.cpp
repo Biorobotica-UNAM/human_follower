@@ -85,8 +85,12 @@ private:
 
     // Params y Estado
     float control_alpha_, control_beta_, max_linear_, max_angular_, dist_to_human_;
-    bool move_backwards_, enable_;
+    bool move_backwards_, enable_, use_potfields_;
     std::string legs_pose_topic_, person_pose_topic_, cmd_vel_topic_;
+
+    //potenciales
+    float repulsiveForce_=0.0f;
+    const float KInfRep_ = 0.03f;
     
     geometry_msgs::msg::PointStamped last_legs_msg_, last_body_msg_;
     bool have_legs_ = false, have_body_ = false;
