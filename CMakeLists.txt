@@ -15,7 +15,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(urg_node REQUIRED)
+find_package(std_srvs REQUIRED)
 
 
 add_executable(leg_finder_node src/leg_finder_node.cpp)
