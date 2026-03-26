@@ -226,7 +226,7 @@ private:
 
     void control_loop() {
         if (!enable_) {
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Waiting for enable (true) on /hri/human_following/enable");
+            //RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Waiting for enable (true) on /hri/human_following/enable");
             return;
         }
 
