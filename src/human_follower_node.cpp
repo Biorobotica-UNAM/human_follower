@@ -1,213 +1,127 @@
 #include <iostream>
 #include <cmath>
-#include <memory>
-
+#include <algorithm>
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/bool.hpp"
-#include "std_msgs/msg/empty.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
+#include "std_msgs/msg/bool.hpp"
 
-#include "tf2_ros/transform_listener.h"
-#include "tf2_ros/buffer.h"
-#include "tf2_eigen/tf2_eigen.hpp"
-#include <Eigen/Geometry>
+using namespace std::chrono_literals;
 
-class HumanFollower : public rclcpp::Node
-{
+class HumanFollower : public rclcpp::Node {
 public:
-    HumanFollower()
-    : Node("human_follower"), enable_(false)
-    {
-        RCLCPP_INFO(this->get_logger(), "INITIALIZING HUMAN FOLLOWER NODE...");
-
-        // Parámetros
+    HumanFollower() : Node("human_follower"), enable_(false) {
+        // Parámetros de control (Mantengo tus valores originales que ya funcionan)
         control_alpha_  = this->declare_parameter("control_alpha", 0.6548);
         control_beta_   = this->declare_parameter("control_beta", 0.3);
         max_linear_     = this->declare_parameter("max_linear", 0.3);
         max_angular_    = this->declare_parameter("max_angular", 0.7);
-        dist_to_human_  = this->declare_parameter("distance_to_human", 0.9);
-        move_backwards_ = this->declare_parameter("move_backwards", false);
-        use_potfields_  = this->declare_parameter("enable_potfields", false);
-        cmd_vel_topic_   = this->declare_parameter("cmd_vel_topic", std::string("/cmd_vel"));
-        legs_pose_topic_ = this->declare_parameter("legs_pose_topic", std::string("/hri/leg_finder/leg_pose"));
+        dist_to_human_  = this->declare_parameter("distance_to_human", 0.65);
+        
+        // Publisher de velocidades
+        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>("/hardware/base/cmd_vel", 10);
 
-        // TF2 setup
-        tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        // Suscriptor al objetivo YA filtrado y fusionado por la FSM
+        sub_target_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+            "/hri/target_filtered", 10, 
+            std::bind(&HumanFollower::callback_target, this, std::placeholders::_1));
 
-        // Pub/Sub
-        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
-            rclcpp::QoS(rclcpp::KeepLast(10))
-            .reliability(rclcpp::ReliabilityPolicy::Reliable)
-            .durability(rclcpp::DurabilityPolicy::TransientLocal));
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/human_following/enable", 1,
-            std::bind(&HumanFollower::callback_enable, this, std::placeholders::_1));
-        sub_stop_ = this->create_subscription<std_msgs::msg::Empty>(
-            "/stop", 1,
-            std::bind(&HumanFollower::callback_stop, this, std::placeholders::_1));
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { enable_ = msg->data; });
 
-        control_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(30),
-            std::bind(&HumanFollower::control_loop, this));
-
-        RCLCPP_INFO(this->get_logger(), 
-            "max_linear=%.2f max_angular=%.2f alpha=%.2f beta=%.2f",
-            max_linear_, max_angular_, control_alpha_, control_beta_);
-        RCLCPP_INFO(this->get_logger(), 
-            "cmd_vel topic: %s  legs_pose_topic: %s",
-            cmd_vel_topic_.c_str(), legs_pose_topic_.c_str());
+        // Timer de control (30ms = ~33Hz)
+        timer_ = this->create_wall_timer(30ms, std::bind(&HumanFollower::control_loop, this));
+        
+        last_time_ = this->get_clock()->now();
     }
 
 private:
-
-    // Timers
-    rclcpp::TimerBase::SharedPtr control_timer_;
-
-    // Subs / pubs
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_legs_pose_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
-
-    // TF
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-
-    // Parámetros
-    float control_alpha_, control_beta_, max_linear_, max_angular_, dist_to_human_;
-    bool move_backwards_, use_potfields_;
-    std::string legs_pose_topic_, cmd_vel_topic_;
-
-    // Estado interno
+    // --- Variables de Estado ---
     bool enable_;
+    geometry_msgs::msg::PointStamped last_target_;
+    bool has_target_ = false;
     
-    // Potenciales
-    float repulsiveForce_ = 0.0f;
-    float KInfRep_ = 0.03f;
+    // Perfil de velocidad
+    double last_linear_vel_ = 0.0;
+    double last_angular_vel_ = 0.0;
+    const double MAX_ACCEL = 0.5;       // m/s^2
+    const double MAX_ALPHA_ACCEL = 1.0; // rad/s^2
     
-    // Follower state
-    float human_x_ = 0.0f;
-    float human_y_ = 0.0f;
-    bool have_target_ = false;
-    int no_legs_ = 0;
-    
+    float control_alpha_, control_beta_, max_linear_, max_angular_, dist_to_human_;
+    rclcpp::Time last_time_;
+
     // --- Callbacks ---
-    void callback_enable(const std_msgs::msg::Bool::SharedPtr msg)
-    {
-        enable_ = msg->data;
-        if (enable_)
-        {
-            sub_legs_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-                legs_pose_topic_, 1,
-                std::bind(&HumanFollower::callback_legs_pose, this, std::placeholders::_1));
-            RCLCPP_INFO(this->get_logger(), "Enabled human follower");
-            }
-        else
-        {
-            sub_legs_pose_.reset();
-            RCLCPP_INFO(this->get_logger(), "Disabled human follower");
-        }
+    void callback_target(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+        last_target_ = *msg;
+        has_target_ = true;
     }
 
-    void callback_stop(const std_msgs::msg::Empty::SharedPtr)
-    {
-        sub_legs_pose_.reset();
-        enable_ = false;
-        RCLCPP_INFO(this->get_logger(), "Stopped human follower");
-    }
+    void control_loop() {
+        auto now = this->get_clock()->now();
+        double dt = (now - last_time_).seconds();
+        last_time_ = now;
 
-    void callback_legs_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg)
-    {
-        float x = msg->point.x;
-        float y = msg->point.y;
-
-        if (msg->header.frame_id != "base_link")
-        {
-            try {
-                transform_to_robot_position(x, y, msg->header.frame_id, x, y);
-            } catch (const tf2::TransformException &ex) {
-                RCLCPP_WARN(this->get_logger(), "TF2 error: %s", ex.what());
-                return;
-            }
-        }
-        human_x_ = x;
-        human_y_ = y;
-        have_target_ = true;
-    }
-
-    geometry_msgs::msg::Twist calculate_speeds(float goal_x, float goal_y)
-    {
-        float angle_error = atan2(goal_y, goal_x);
-        float distance = sqrt(goal_x * goal_x + goal_y * goal_y);
-        distance -= dist_to_human_;
-        if (!move_backwards_ && distance < 0) distance = 0;
-        if (distance > max_linear_) distance = max_linear_;
-
-        geometry_msgs::msg::Twist result;
-        if (distance > 0 || move_backwards_)
-        {
-            result.linear.x = distance * exp(-(angle_error * angle_error) / control_alpha_);
-            result.linear.y = 0;
-            if (use_potfields_) result.linear.y = KInfRep_ * repulsiveForce_;
-            result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
-        }
-        else
-        {
-            result.linear.x = 0;
-            result.linear.y = 0;
-            if (fabs(angle_error) >= M_PI_4 / 6.0f)
-                result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
-            else
-                result.angular.z = 0;
-        }
-        return result;
-    }
-
-    void transform_to_robot_position(float x, float y, const std::string &frame_id,
-                                     float &x_wrt_robot, float &y_wrt_robot)
-    {
-        geometry_msgs::msg::TransformStamped tf_msg =
-            tf_buffer_->lookupTransform("base_link", frame_id, tf2::TimePointZero);
-        Eigen::Affine3d e = tf2::transformToEigen(tf_msg.transform);
-        Eigen::Vector3d v(x, y, 0);
-        v = e * v;
-        x_wrt_robot = v.x();
-        y_wrt_robot = v.y();
-    }
-
-    void control_loop(){
-        if (!enable_) return;
-
-        if (have_target_)
-        {
-            no_legs_ = 0;
-            geometry_msgs::msg::Twist cmd = calculate_speeds(human_x_, human_y_);
-            pub_cmd_vel_->publish(cmd);
-            have_target_ = false;
+        if (!enable_ || !has_target_ || (now - last_target_.header.stamp).seconds() > 0.5) {
+            stop_robot();
+            return;
         }
 
-        else
-        {
-            if (++no_legs_ > 30)
-            {
-                no_legs_ = 0;
-                geometry_msgs::msg::Twist stop_cmd;
-                stop_cmd.linear.x = 0.0;
-                stop_cmd.angular.z = 0.0;
-                pub_cmd_vel_->publish(stop_cmd);
-            }
-        }
+        // 1. Calcular velocidades deseadas (Raw)
+        geometry_msgs::msg::Twist raw_vel = calculate_raw_speeds(last_target_.point.x, last_target_.point.y);
+
+        // 2. Aplicar Rampas de Aceleración para suavidad
+        geometry_msgs::msg::Twist smooth_vel;
+        
+        double max_dv = MAX_ACCEL * dt;
+        double dv = raw_vel.linear.x - last_linear_vel_;
+        last_linear_vel_ += std::clamp(dv, -max_dv, max_dv);
+
+        double max_dw = MAX_ALPHA_ACCEL * dt;
+        double dw = raw_vel.angular.z - last_angular_vel_;
+        last_angular_vel_ += std::clamp(dw, -max_dw, max_dw);
+
+        smooth_vel.linear.x = last_linear_vel_;
+        smooth_vel.angular.z = last_angular_vel_;
+
+        pub_cmd_vel_->publish(smooth_vel);
     }
+
+    geometry_msgs::msg::Twist calculate_raw_speeds(float gx, float gy) {
+        geometry_msgs::msg::Twist vel;
+        float dist_total = sqrt(gx*gx + gy*gy);
+        float angle_error = atan2(gy, gx);
+        float dist_error = dist_total - dist_to_human_;
+
+        // Tu lógica de control original mejorada
+        if (std::abs(dist_error) > 0.05 || std::abs(angle_error) > 0.1) {
+            // Velocidad lineal con decaimiento según el error de ángulo (exponencial)
+            float target_lin = std::clamp(dist_error, -max_linear_, max_linear_);
+            vel.linear.x = target_lin * exp(-(angle_error * angle_error) / control_alpha_);
+            
+            // Velocidad angular usando la sigmoide que tenías
+            vel.angular.z = max_angular_ * (2.0f / (1.0f + exp(-angle_error / control_beta_)) - 1.0f);
+        }
+        return vel;
+    }
+
+    void stop_robot() {
+        last_linear_vel_ = 0.0;
+        last_angular_vel_ = 0.0;
+        pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
+        has_target_ = false;
+    }
+
+    // Publishers/Subscribers...
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_target_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
+    rclcpp::TimerBase::SharedPtr timer_;
 };
 
-// --- main ---
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<HumanFollower>();
-    rclcpp::spin(node);
+    rclcpp::spin(std::make_shared<HumanFollower>());
     rclcpp::shutdown();
     return 0;
 }
