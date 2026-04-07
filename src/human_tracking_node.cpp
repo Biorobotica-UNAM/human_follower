@@ -14,9 +14,9 @@ public:
         pub_hf_enable_ = this->create_publisher<std_msgs::msg::Bool>("/hri/human_following/enable", 1);
         pub_lf_enable_ =this->create_publisher<std_msgs::msg::Bool>("/hri/leg_finder/enable", 1);
         
-        pub_person_tracker_enable_ = this->create_publisher<std_msgs::msg::Bool>("/person_tracker/enable", 1);
-        pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
-        pub_yd_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
+
+        pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/vision/enable_continous", 1);
+        //pub_yd_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
 
         // Services
         human_tracking_srv_ = this->create_service<std_srvs::srv::SetBool>(

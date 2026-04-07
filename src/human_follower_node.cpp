@@ -16,16 +16,25 @@ public:
         control_beta_   = this->declare_parameter("control_beta", 0.3);
         max_linear_     = this->declare_parameter("max_linear", 0.3);
         max_angular_    = this->declare_parameter("max_angular", 0.7);
+        dist_to_human_  = this->declare_parameter("distance_to_human", 0.9);
+        move_backwards_ = this->declare_parameter("move_backwards", false);
+        use_potfields_  = this->declare_parameter("enable_potfields", false);
+        cmd_vel_topic_   = this->declare_parameter("cmd_vel_topic", std::string("/cmd_vel"));
+        legs_pose_topic_ = this->declare_parameter("legs_pose_topic", std::string("/hri/leg_finder/leg_pose"));
         dist_to_human_  = this->declare_parameter("distance_to_human", 0.65);
         
         // Publisher de velocidades
         pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>("/hardware/base/cmd_vel", 10);
 
-        // Suscriptor al objetivo YA filtrado y fusionado por la FSM
-        sub_target_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-            "/hri/target_filtered", 10, 
-            std::bind(&HumanFollower::callback_target, this, std::placeholders::_1));
+        // TF2 setup
+        tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+        // Pub/Sub
+        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
+            rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliability(rclcpp::ReliabilityPolicy::Reliable)
+            .durability(rclcpp::DurabilityPolicy::TransientLocal));
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/human_following/enable", 1,
             [this](const std_msgs::msg::Bool::SharedPtr msg) { enable_ = msg->data; });
