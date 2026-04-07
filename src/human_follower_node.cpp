@@ -5,6 +5,8 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_ros/buffer.h"
 
 using namespace std::chrono_literals;
 
@@ -126,6 +128,15 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_target_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
     rclcpp::TimerBase::SharedPtr timer_;
+    // Parameters
+    bool move_backwards_;
+    bool use_potfields_;
+    std::string cmd_vel_topic_;
+    std::string legs_pose_topic_;
+
+    // TF2 Objects
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 };
 
 int main(int argc, char **argv) {
