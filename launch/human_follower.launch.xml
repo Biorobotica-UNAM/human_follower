@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
 
-  <include file="$(find-pkg-share justina_description)/launch/display.launch.xml"/>
+  <!--<include file="$(find-pkg-share justina_description)/launch/display.launch.xml"/>-->
 
   <!-- <include file="$(find-pkg-share human_follower)/launch/hokuyo_usb.launch.xml"/> -->
 
@@ -12,12 +12,13 @@
     <param name="laser_scan_frame" value="laser_link"/>
     <param name="frame_id" value="base_link"/>
     <param name="show_hypothesis" value="true"/>
+    <param name="serial_port" value="/dev/ttyACM0"/>
     <param name="scan_downsample" value="1"/>
   </node>
 
   <!-- Human follower node -->
 
-  <node pkg="human_follower" exec="human_follower_node" name="human_follower_node" output="screen">
+  <node pkg="human_follower" exec="human_follower_nodeV2" name="human_follower_nodeV2" output="screen">
     <param name="control_alpha" value="0.6548"/>
     <param name="control_beta" value="0.3"/>
     <param name="max_linear" value="0.3"/>
@@ -26,6 +27,7 @@
     <param name="move_backwards" value="false"/>
     <param name="enable_potfields" value="false"/>
     <param name="cmd_vel_topic" value="/hardware/base/cmd_vel"/>
+    <param name="person_pose_topic" value="/hardware/head/look_at"/>
   </node>
 
   <!-- Pipeline handler node -->

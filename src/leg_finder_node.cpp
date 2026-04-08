@@ -50,19 +50,26 @@
 #define BFB2Y 0.054296799022543
 #define BFB3Y 0.018098933007514
 
+struct Flank{
+    float x;
+    float y;
+    bool used = false;
+};
+
 class LegFinder : public rclcpp::Node
 {
 public:
     LegFinder() : Node("leg_finder"), legs_found_(false), stop_robot_(false),
-                  legs_in_front_cnt_(0), legs_lost_counter_(0)
+                  legs_in_front_cnt_(0), legs_lost_counter_(0), set_stage_(true)
     {
         RCLCPP_INFO(this->get_logger(), "INITIALIZING LEG FINDER");
 
         laser_scan_topic_ = this->declare_parameter("laser_scan_topic", "/scan");
-        laser_scan_frame_ = this->declare_parameter("laser_scan_frame", "laser_link");
         frame_id_         = this->declare_parameter("frame_id", "base_link");
         show_hypothesis_  = this->declare_parameter("show_hypothesis", true);
         scan_downsampling_ = this->declare_parameter("scan_downsampling", 1);
+        //TODO: to auto set the laser scan frame from the first msg topic
+        //laser_scan_frame_ = this->declare_parameter("laser_scan_frame", "laser_link");
 
         pub_legs_hypothesis_ = this->create_publisher<visualization_msgs::msg::Marker>("/hri/leg_finder/hypothesis", 1);
         pub_legs_pose_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/hri/leg_finder/leg_pose", 1);
@@ -84,6 +91,7 @@ public:
         legs_y_filter_input_.assign(4, 0.0);
         legs_y_filter_output_.assign(4, 0.0);
 
+
         RCLCPP_INFO(this->get_logger(), "Ready. show_hypothesis=%s, laser_topic=%s",
                     show_hypothesis_ ? "True" : "False", laser_scan_topic_.c_str());
     }
@@ -100,6 +108,7 @@ private:
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
+    bool set_stage_;
     bool legs_found_;
     bool stop_robot_;
     int legs_in_front_cnt_;
@@ -142,100 +151,49 @@ private:
 
     void callback_scan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
     {
+        // Auto-set laser scan frame from the first message
+        if (set_stage_){
+            laser_scan_frame_ = msg->header.frame_id;
+            set_stage_ = false;
+            RCLCPP_INFO(this->get_logger(), "Laser scan frame set to %s", laser_scan_frame_.c_str());
+        }
+
+        // Downsample and filter laser scan
         std::vector<float> ranges = msg->ranges;
         if (scan_downsampling_ > 1)
             ranges = downsample_scan(ranges, scan_downsampling_);
         ranges = filter_laser_ranges(ranges);
 
+        // Get leg hypotheses
         std::vector<float> legs_x, legs_y;
         find_leg_hypothesis(msg, legs_x, legs_y);
 
-        if (show_hypothesis_)
-        {
+        // publish leg hypotheses markers
+        if (show_hypothesis_){
             auto marker = get_hypothesis_marker(legs_x, legs_y);
             pub_legs_hypothesis_->publish(marker);
         }
 
-        float nearest_x, nearest_y;
+        // Get nearest leg in front of the robot
+        float nearest_x = MAX_FLOAT, nearest_y = MAX_FLOAT;
+        bool leg_in_front = get_nearest_legs_in_front(legs_x, legs_y, nearest_x, nearest_y);
+
+        // Logic to find and track legs
         if (!legs_found_ && !stop_robot_)
         {
-            if (get_nearest_legs_in_front(legs_x, legs_y, nearest_x, nearest_y))
-                legs_in_front_cnt_++;
-            if (legs_in_front_cnt_ > 20)
-            {
-                legs_found_ = true;
-                legs_lost_counter_ = 0;
-                last_legs_pose_x_ = nearest_x;
-                last_legs_pose_y_ = nearest_y;
-                for (int i = 0; i < 4; i++)
-                {
-                    legs_x_filter_input_[i] = nearest_x;
-                    legs_x_filter_output_[i] = nearest_x;
-                    legs_y_filter_input_[i] = nearest_y;
-                    legs_y_filter_output_[i] = nearest_y;
-                }
-            }
+            handle_leg_acquisition(leg_in_front, nearest_x, nearest_y);
         }
         else if (legs_found_)
         {
-            geometry_msgs::msg::PointStamped filtered_legs;
-            filtered_legs.header.frame_id = frame_id_;
-            filtered_legs.point.z = 0.3;
-            bool fobst_in_front = false;
-
-            if(!fobst_in_front){
-
-            //float diff = sqrt((nearest_x - last_legs_pose_x)*(nearest_x - last_legs_pose_x) +
-            //		  (nearest_y - last_legs_pose_y)*(nearest_y - last_legs_pose_y));
-            bool publish_legs = false;
-            if(get_nearest_legs_to_last_legs(legs_x, legs_y, nearest_x, nearest_y, last_legs_pose_x_, last_legs_pose_y_))
-            {
-                last_legs_pose_x_ = nearest_x;
-                last_legs_pose_y_ = nearest_y;
-                legs_x_filter_input_.insert(legs_x_filter_input_.begin(), nearest_x);
-                legs_y_filter_input_.insert(legs_y_filter_input_.begin(), nearest_y);
-                legs_lost_counter_ = 0;
-                publish_legs = true;
-            }
-            else
-            {
-                legs_x_filter_input_.insert(legs_x_filter_input_.begin(), last_legs_pose_x_);
-                legs_y_filter_input_.insert(legs_y_filter_input_.begin(), last_legs_pose_y_);
-                if(++legs_lost_counter_ > 20)
-                {
-                    legs_found_ = false;
-                    legs_in_front_cnt_ = 0;
-                }
-            }
-            legs_x_filter_input_.pop_back();
-            legs_y_filter_input_.pop_back();
-            legs_x_filter_output_.pop_back();
-            legs_y_filter_output_.pop_back();
-            legs_x_filter_output_.insert(legs_x_filter_output_.begin(), 0);
-            legs_y_filter_output_.insert(legs_y_filter_output_.begin(), 0);
-
-            legs_x_filter_output_[0]  = BFB0X*legs_x_filter_input_[0] + BFB1X*legs_x_filter_input_[1] +
-            BFB2X*legs_x_filter_input_[2] + BFB3X*legs_x_filter_input_[3];
-            legs_x_filter_output_[0] -= BFA1X*legs_x_filter_output_[1] + BFA2X*legs_x_filter_output_[2] + BFA3X*legs_x_filter_output_[3];
-
-            legs_y_filter_output_[0]  = BFB0Y*legs_y_filter_input_[0] + BFB1Y*legs_y_filter_input_[1] +
-                BFB2Y*legs_y_filter_input_[2] + BFB3Y*legs_y_filter_input_[3];
-            legs_y_filter_output_[0] -= BFA1Y*legs_y_filter_output_[1] + BFA2Y*legs_y_filter_output_[2] + BFA3Y*legs_y_filter_output_[3];
-
-            filtered_legs.point.x = legs_x_filter_output_[0];
-            filtered_legs.point.y = legs_y_filter_output_[0];
-
-            stop_robot_ = false;
-        
-            if(publish_legs)
-                pub_legs_pose_->publish(filtered_legs);
+            handle_leg_tracking(legs_x, legs_y, nearest_x, nearest_y);
         }
         else
             stop_robot_ = true;
-    }
+    // Publish legs state
     std_msgs::msg::Bool msg_found;
     msg_found.data = legs_found_;
     pub_legs_found_->publish(msg_found);
+
     }
 
     // ===== FUNCIONES AUXILIARES =====
@@ -335,120 +293,137 @@ private:
         return marker;
     }
 
-
-    void find_leg_hypothesis(const sensor_msgs::msg::LaserScan::SharedPtr laser, std::vector<float>& legs_x, std::vector<float>& legs_y)
+    std::pair<std::vector<float>, std::vector<float>>
+    project_laser_to_base(const sensor_msgs::msg::LaserScan::SharedPtr laser)
     {
-        std::vector<float> laser_x;
-        std::vector<float> laser_y;
-        laser_x.resize(laser->ranges.size());
-        laser_y.resize(laser->ranges.size());
+        std::vector<float> laser_x(laser->ranges.size());
+        std::vector<float> laser_y(laser->ranges.size());
+
         Eigen::Affine3d lidar_to_robot = get_lidar_position();
-        float theta = laser->angle_min;
-        for(size_t i=0; i < laser->ranges.size(); i++)
+
+        for (size_t i = 0; i < laser->ranges.size(); i++)
         {
-            theta = laser->angle_min + i*laser->angle_increment*scan_downsampling_;
-            Eigen::Vector3d v(laser->ranges[i] * cos(theta), laser->ranges[i] * sin(theta), 0);
+            float theta = laser->angle_min + i * laser->angle_increment * scan_downsampling_;
+            Eigen::Vector3d v(laser->ranges[i] * cos(theta),
+                            laser->ranges[i] * sin(theta), 0.0);
+
             v = lidar_to_robot * v;
+
             laser_x[i] = v.x();
             laser_y[i] = v.y();
         }
 
-        std::vector<float> flank_x;
-        std::vector<float> flank_y;
-        std::vector<bool>  flank_id;
-        int ant2 = 0;
-        float px, py, sum_x, sum_y, cua_x, cua_y;
+        return {laser_x, laser_y};
+    }
 
-        legs_x.clear();
-        legs_y.clear();
-        for(int i=1; i < laser->ranges.size(); i++)
+    std::vector<Flank> detect_flanks(
+        const sensor_msgs::msg::LaserScan::SharedPtr laser,
+        const std::vector<float>& laser_x,
+        const std::vector<float>& laser_y)
+    {
+        std::vector<Flank> flanks;
+        size_t ant2 = 0;
+
+        for (size_t i = 1; i < laser->ranges.size(); i++)
         {
-            int ant = ant2;
-            if(fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD) ant2 = i;
-            if(fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD &&
-            (is_leg(laser_x[ant], laser_y[ant], laser_x[i-1], laser_y[i-1]) || 
-                    is_leg(laser_x[ant+1], laser_y[ant+1], laser_x[i-2], laser_y[i-2])))
+            size_t ant = ant2;
+
+            if (fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD)
+                ant2 = i;
+
+            if (fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD &&
+                (is_leg(laser_x[ant], laser_y[ant], laser_x[i-1], laser_y[i-1]) ||
+                is_leg(laser_x[ant+1], laser_y[ant+1], laser_x[i-2], laser_y[i-2])))
             {
-                if((pow(laser_x[ant] - laser_x[i-1], 2) + pow(laser_y[ant] - laser_y[i-1], 2)) > LEG_THIN &&
-                        (pow(laser_x[ant] - laser_x[i-1], 2) + pow(laser_y[ant] - laser_y[i-1], 2)) < LEG_THICK)
+                float dx = laser_x[ant] - laser_x[i-1];
+                float dy = laser_y[ant] - laser_y[i-1];
+                float dist2 = dx*dx + dy*dy;
+
+                float sum_x = 0, sum_y = 0;
+                for (size_t j = ant; j < i; j++)
                 {
-                    sum_x = 0;
-                    sum_y = 0;
-                    for(int j= ant; j < i; j++)
-                    {
-                        sum_x += laser_x[j];
-                        sum_y += laser_y[j];
-                    }
-                    flank_x.push_back(sum_x / (float)(i - ant));
-                    flank_y.push_back(sum_y / (float)(i - ant));
-                    flank_id.push_back(false);
+                    sum_x += laser_x[j];
+                    sum_y += laser_y[j];
                 }
-                else if((pow(laser_x[ant] - laser_x[i-1], 2) + pow(laser_y[ant] - laser_y[i-1], 2)) > TWO_LEGS_THIN &&
-                        (pow(laser_x[ant] - laser_x[i-1], 2) + pow(laser_y[ant] - laser_y[i-1], 2)) < TWO_LEGS_THICK)
+
+                float cx = sum_x / (i - ant);
+                float cy = sum_y / (i - ant);
+
+                if (dist2 > LEG_THIN && dist2 < LEG_THICK)
                 {
-                    sum_x = 0;
-                    sum_y = 0;
-                    for(int j= ant; j < i; j++)
-                    {
-                        sum_x += laser_x[j];
-                        sum_y += laser_y[j];
-                    }
-                    cua_x = sum_x / (float)(i - ant);
-                    cua_y = sum_y / (float)(i - ant);
-                    legs_x.push_back(cua_x);
-                    legs_y.push_back(cua_y);
+                    flanks.push_back({cx, cy, false});
+                }
+                else if (dist2 > TWO_LEGS_THIN && dist2 < TWO_LEGS_THICK)
+                {
+                    flanks.push_back({cx, cy, true}); // ya considerada doble
                 }
             }
         }
 
-        for(int i=0; i < (int)(flank_x.size())-2; i++)
-            for(int j=1; j < 3; j++)
-                if((pow(flank_x[i] - flank_x[i+j], 2) + pow(flank_y[i] - flank_y[i+j], 2)) > TWO_LEGS_NEAR &&
-                        (pow(flank_x[i] - flank_x[i+j], 2) + pow(flank_y[i] - flank_y[i+j], 2)) < TWO_LEGS_FAR)
+        return flanks;
+    }
+
+    void detect_double_legs(std::vector<Flank>& flanks,
+                        std::vector<float>& legs_x,
+                        std::vector<float>& legs_y)
+    {
+        for (size_t i = 0; i < flanks.size() - 1; i++)
+        {
+            for (size_t j = i + 1; j < flanks.size(); j++)
+            {
+                if (flanks[i].used || flanks[j].used)
+                    continue;
+
+                float dx = flanks[i].x - flanks[j].x;
+                float dy = flanks[i].y - flanks[j].y;
+                float dist2 = dx*dx + dy*dy;
+
+                if (dist2 > TWO_LEGS_NEAR && dist2 < TWO_LEGS_FAR)
                 {
-                    px = (flank_x[i] + flank_x[i + j])/2;
-                    py = (flank_y[i] + flank_y[i + j])/2;
-                    if((px*px + py*py) < HORIZON_THRESHOLD)
+                    float px = (flanks[i].x + flanks[j].x) / 2.0;
+                    float py = (flanks[i].y + flanks[j].y) / 2.0;
+
+                    if ((px*px + py*py) < HORIZON_THRESHOLD)
                     {
-                        cua_x = px;
-                        cua_y = py;
-                        legs_x.push_back(cua_x);
-                        legs_y.push_back(cua_y);
-                        flank_id[i] = true;
-                        flank_id[i+j] = true;
+                        legs_x.push_back(px);
+                        legs_y.push_back(py);
+                        flanks[i].used = true;
+                        flanks[j].used = true;
                     }
                 }
-/*
-    if(flank_y.size() > 1 &&
-            (pow(flank_x[flank_x.size()-2] - flank_x[flank_x.size()-1], 2) +
-             pow(flank_y[flank_y.size()-2] - flank_y[flank_y.size()-1], 2)) > TWO_LEGS_NEAR &&
-            (pow(flank_x[flank_x.size()-2] - flank_x[flank_x.size()-1], 2) +
-             pow(flank_y[flank_y.size()-2] - flank_y[flank_y.size()-1], 2)) < TWO_LEGS_FAR)
-    {
-        px = (flank_x[flank_x.size()-2] + flank_x[flank_x.size()-1])/2.0;
-        py = (flank_y[flank_y.size()-2] + flank_y[flank_y.size()-1])/2.0;
-        if((px*px + py*py) < HORIZON_THRESHOLD)
-        {
-            cua_x = px;
-            cua_y = py;
-            legs_x.push_back(cua_x);
-            legs_y.push_back(cua_y);
-            flank_id[flank_y.size() - 2] = true;
-            flank_id[flank_y.size() - 1] = true;
+            }
         }
     }
-*/
-    for(int i=0; i < flank_y.size(); i++)
-        if(!flank_id[i])
-        {
-            float cua_x, cua_y;
-            cua_x = flank_x[i];
-            cua_y = flank_y[i];
-            legs_x.push_back(cua_x);
-            legs_y.push_back(cua_y);
-            }
 
-        //std::cout << "LegFinder.->Found " << legs_x.size() << " leg hypothesis" << std::endl;*/
+
+    void add_single_legs(const std::vector<Flank>& flanks,
+                     std::vector<float>& legs_x,
+                     std::vector<float>& legs_y)
+    {
+        for (const auto& f : flanks)
+        {
+            if (!f.used)
+            {
+                legs_x.push_back(f.x);
+                legs_y.push_back(f.y);
+            }
+        }
+    }
+    void find_leg_hypothesis(
+        const sensor_msgs::msg::LaserScan::SharedPtr laser,
+        std::vector<float>& legs_x,
+        std::vector<float>& legs_y)
+    {
+        legs_x.clear();
+        legs_y.clear();
+
+        auto [laser_x, laser_y] = project_laser_to_base(laser);
+
+        auto flanks = detect_flanks(laser, laser_x, laser_y);
+
+        detect_double_legs(flanks, legs_x, legs_y);
+
+        add_single_legs(flanks, legs_x, legs_y);
     }
 
     bool get_nearest_legs_in_front(std::vector<float>& legs_x, std::vector<float>& legs_y, float& nearest_x, float& nearest_y)
@@ -456,7 +431,7 @@ private:
         nearest_x = MAX_FLOAT;
         nearest_y = MAX_FLOAT;
         float min_dist = MAX_FLOAT;
-        for(int i=0; i < legs_x.size(); i++)
+        for(size_t i=0; i < legs_x.size(); i++)
         {
             if(!(legs_x[i] > IN_FRONT_MIN_X && legs_x[i] < IN_FRONT_MAX_X && legs_y[i] > IN_FRONT_MIN_Y && legs_y[i] < IN_FRONT_MAX_Y))
                 continue;
@@ -477,7 +452,7 @@ private:
         nearest_x = MAX_FLOAT;
         nearest_y = MAX_FLOAT;
         float min_dist = MAX_FLOAT;
-        for(int i=0; i < legs_x.size(); i++)
+        for(size_t i=0; i < legs_x.size(); i++)
         {
             float dist = sqrt((legs_x[i] - last_x)*(legs_x[i] - last_x) + (legs_y[i] - last_y)*(legs_y[i] - last_y));
             if(dist < min_dist)
@@ -488,14 +463,84 @@ private:
             }
         }
         return min_dist < 0.33;
-        /*
-        if(min_dist > 0.5)
-        {
-        nearest_x = last_x;
-        nearest_y = last_y;
-        return false;
+    }
+
+    void handle_leg_acquisition(bool legs_in_front, float nearest_x, float nearest_y)
+    {
+        if (legs_in_front) legs_in_front_cnt_++;
+        if (legs_in_front_cnt_ > 20) {
+            legs_found_ = true;
+            legs_lost_counter_ = 0;
+            last_legs_pose_x_ = nearest_x;
+            last_legs_pose_y_ = nearest_y;
+            // Inicializar filtros
+            for (size_t i = 0; i < 4; i++) {
+                legs_x_filter_input_[i] = nearest_x;
+                legs_x_filter_output_[i] = nearest_x;
+                legs_y_filter_input_[i] = nearest_y;
+                legs_y_filter_output_[i] = nearest_y;
+            }
         }
-        return true;*/
+    }
+
+    void handle_leg_tracking(std::vector<float>& legs_x, std::vector<float>& legs_y,
+                            float nearest_x, float nearest_y)
+    {
+        geometry_msgs::msg::PointStamped filtered_legs;
+        filtered_legs.header.frame_id = frame_id_;
+        filtered_legs.point.z = 0.3;
+
+        bool publish_legs = false;
+        bool fobst_in_front = false; // Puedes usar obst_in_front() si quieres detección de obstáculos
+
+        if (!fobst_in_front) {
+            if (get_nearest_legs_to_last_legs(legs_x, legs_y, nearest_x, nearest_y, last_legs_pose_x_, last_legs_pose_y_)) {
+                update_filters(nearest_x, nearest_y);
+                publish_legs = true;
+            } else {
+                update_filters(last_legs_pose_x_, last_legs_pose_y_);
+                if (++legs_lost_counter_ > 20) {
+                    legs_found_ = false;
+                    legs_in_front_cnt_ = 0;
+                }
+            }
+
+            // Aplicar Butterworth
+            apply_butterworth(filtered_legs);
+
+            if (publish_legs) pub_legs_pose_->publish(filtered_legs);
+        } else {
+            stop_robot_ = true;
+        }
+    }
+
+    void update_filters(float x, float y)
+    {
+        legs_x_filter_input_.insert(legs_x_filter_input_.begin(), x);
+        legs_y_filter_input_.insert(legs_y_filter_input_.begin(), y);
+        legs_x_filter_input_.pop_back();
+        legs_y_filter_input_.pop_back();
+        legs_x_filter_output_.pop_back();
+        legs_y_filter_output_.pop_back();
+        legs_x_filter_output_.insert(legs_x_filter_output_.begin(), 0);
+        legs_y_filter_output_.insert(legs_y_filter_output_.begin(), 0);
+
+        last_legs_pose_x_ = x;
+        last_legs_pose_y_ = y;
+    }
+
+    void apply_butterworth(geometry_msgs::msg::PointStamped& filtered_legs)
+    {
+        legs_x_filter_output_[0]  = BFB0X*legs_x_filter_input_[0] + BFB1X*legs_x_filter_input_[1] +
+                                    BFB2X*legs_x_filter_input_[2] + BFB3X*legs_x_filter_input_[3];
+        legs_x_filter_output_[0] -= BFA1X*legs_x_filter_output_[1] + BFA2X*legs_x_filter_output_[2] + BFA3X*legs_x_filter_output_[3];
+
+        legs_y_filter_output_[0]  = BFB0Y*legs_y_filter_input_[0] + BFB1Y*legs_y_filter_input_[1] +
+                                    BFB2Y*legs_y_filter_input_[2] + BFB3Y*legs_y_filter_input_[3];
+        legs_y_filter_output_[0] -= BFA1Y*legs_y_filter_output_[1] + BFA2Y*legs_y_filter_output_[2] + BFA3Y*legs_y_filter_output_[3];
+
+        filtered_legs.point.x = legs_x_filter_output_[0];
+        filtered_legs.point.y = legs_y_filter_output_[0];
     }
 };
 
