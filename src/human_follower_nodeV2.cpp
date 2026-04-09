@@ -9,6 +9,11 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 
+// Includes para la fusión estable
+#include "message_filters/subscriber.h"
+#include "message_filters/synchronizer.h"
+#include "message_filters/sync_policies/approximate_time.h"
+
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_eigen/tf2_eigen.hpp"
@@ -18,11 +23,16 @@ using namespace std::chrono_literals;
 
 class HumanFollower : public rclcpp::Node
 {
+    // Política de sincronización: Piernas + Cuerpo
+    typedef message_filters::sync_policies::ApproximateTime<
+        geometry_msgs::msg::PointStamped, 
+        geometry_msgs::msg::PointStamped> SyncPolicy;
+
 public:
     HumanFollower()
     : Node("human_follower"), enable_(false)
     {
-        RCLCPP_INFO(this->get_logger(), "--- INITIALIZING HUMAN FOLLOWER (DEBUG MODE) ---");
+        RCLCPP_INFO(this->get_logger(), "--- INITIALIZING STABLE HUMAN FOLLOWER ---");
 
         // Parámetros
         control_alpha_  = this->declare_parameter("control_alpha", 0.6548);
@@ -33,23 +43,25 @@ public:
         move_backwards_ = this->declare_parameter("move_backwards", false);
         cmd_vel_topic_   = this->declare_parameter("cmd_vel_topic", std::string("/hardware/base/cmd_vel"));
         legs_pose_topic_ = this->declare_parameter("legs_pose_topic", std::string("/hri/leg_finder/leg_pose"));
-        person_pose_topic_ = this->declare_parameter("person_pose_topic", std::string("/human_detection/target_point"));
+        person_pose_topic_ = this->declare_parameter("person_pose_topic", std::string("/human_detection/target_point2"));
 
         // TF2 setup
         tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Publishers
-         pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
-            rclcpp::QoS(rclcpp::KeepLast(10))
-            .reliability(rclcpp::ReliabilityPolicy::Reliable)
-            .durability(rclcpp::DurabilityPolicy::TransientLocal));
-        pub_debug_point_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/human_follower/target_debug", 
-            rclcpp::QoS(rclcpp::KeepLast(10))
-            .reliability(rclcpp::ReliabilityPolicy::Reliable)
-            .durability(rclcpp::DurabilityPolicy::TransientLocal));
+        pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+        pub_debug_point_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/human_follower/target_debug", 10);
         
-        // Subscriptions
+        // --- Setup de Fusión Estable (Message Filters) ---
+        legs_sub_filter_.subscribe(this, legs_pose_topic_, rclcpp::SensorDataQoS().get_rmw_qos_profile());
+        body_sub_filter_.subscribe(this, person_pose_topic_, rclcpp::SensorDataQoS().get_rmw_qos_profile());
+
+        sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+            SyncPolicy(10), legs_sub_filter_, body_sub_filter_);
+        sync_->registerCallback(std::bind(&HumanFollower::callback_fusion, this, std::placeholders::_1, std::placeholders::_2));
+        
+        // Subscriptions de control
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/human_following/enable", 1,
             std::bind(&HumanFollower::callback_enable, this, std::placeholders::_1));
@@ -58,84 +70,99 @@ public:
             "/stop", 1,
             std::bind(&HumanFollower::callback_stop, this, std::placeholders::_1));
 
-        sub_body_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-            person_pose_topic_, 1,
-            std::bind(&HumanFollower::callback_body_pose, this, std::placeholders::_1));
-
-        
-        control_timer_ = this->create_wall_timer(
-            30ms, std::bind(&HumanFollower::control_loop, this));
-
-        RCLCPP_INFO(this->get_logger(), "FUSION MODE: Legs + Person Tracker Active");
+        RCLCPP_INFO(this->get_logger(), "FUSION SYSTEM READY: Waiting for enable...");
     }
 
 private:
-    // Pub/Sub y Timers
-    rclcpp::TimerBase::SharedPtr control_timer_;
+    // Filtros y Sync
+    message_filters::Subscriber<geometry_msgs::msg::PointStamped> legs_sub_filter_;
+    message_filters::Subscriber<geometry_msgs::msg::PointStamped> body_sub_filter_;
+    std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+
+    // Pubs y Subs
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_legs_pose_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_body_pose_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_debug_point_;
 
-    // TF
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     // Params y Estado
     float control_alpha_, control_beta_, max_linear_, max_angular_, dist_to_human_;
-    bool move_backwards_, enable_, use_potfields_;
+    bool move_backwards_, enable_;
+    bool use_potfields_ = false;
     std::string legs_pose_topic_, person_pose_topic_, cmd_vel_topic_;
 
-    //potenciales
-    float repulsiveForce_=0.0f;
-    const float KInfRep_ = 0.03f;
+    // Variables de Filtro LPF y Deadband
+    float last_target_x_ = 0.0, last_target_y_ = 0.0;
+    const float LPF_ALPHA = 0.35;  // Suavizado
+    const float DEADBAND = 0.04;   // 4cm zona muerta
     
-    geometry_msgs::msg::PointStamped last_legs_msg_, last_body_msg_;
-    bool have_legs_ = false, have_body_ = false;
-    int no_legs_ = 0;
-
     // Constantes de Fusión
-    const float MAX_STD_DEV = 0.6;    //distancia maxima aceptable legs/body
-    const float MAX_AGE_MS = 500.0;   // tiempo maximo de validez de un mensaje
-    const float LEG_WEIGHT = 0.6;     //influencia de las piernas 
-    const float BODY_WEIGHT = 0.4;    //influencia del cuerpo
+    const float MAX_STD_DEV = 0.6;    
+    const float LEG_WEIGHT = 0.55;     
+    const float BODY_WEIGHT = 0.45;    
 
-    // --- Callbacks ---
     void callback_enable(const std_msgs::msg::Bool::SharedPtr msg) {
         enable_ = msg->data;
-        if (enable_) {
-            RCLCPP_INFO(this->get_logger(), "SYSTEM ENABLED");
-            sub_legs_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-                legs_pose_topic_, 1,
-                std::bind(&HumanFollower::callback_legs_pose, this, std::placeholders::_1));
-            sub_body_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-                person_pose_topic_, 1,
-                std::bind(&HumanFollower::callback_body_pose, this, std::placeholders::_1));
-        } else {
-            RCLCPP_INFO(this->get_logger(), "SYSTEM DISABLED");
-            sub_legs_pose_.reset();
-            sub_body_pose_.reset();
-        }
+        RCLCPP_INFO(this->get_logger(), "SYSTEM %s", enable_ ? "ENABLED" : "DISABLED");
     }
 
     void callback_stop(const std_msgs::msg::Empty::SharedPtr) {
-
-        sub_legs_pose_.reset();
-        sub_body_pose_.reset();
         enable_ = false;
-        RCLCPP_WARN(this->get_logger(), "STOP RECEIVED");
+        pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
+        RCLCPP_WARN(this->get_logger(), "STOP RECEIVED - Robot Halted");
     }
 
-    void callback_legs_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_legs_msg_ = *msg;
-        have_legs_ = true;
-    }
+    // --- CALLBACK DE FUSIÓN (Reemplaza al control_loop) ---
+    void callback_fusion(const geometry_msgs::msg::PointStamped::ConstSharedPtr& legs_msg,
+                         const geometry_msgs::msg::PointStamped::ConstSharedPtr& body_msg)
+    {
+        if (!enable_) return;
 
-    void callback_body_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_body_msg_ = *msg;
-        have_body_ = true;
+        float lx, ly, bx, by;
+        try {
+            transform_to_robot_position(legs_msg->point.x, legs_msg->point.y, legs_msg->header.frame_id, lx, ly);
+            transform_to_robot_position(body_msg->point.x, body_msg->point.y, body_msg->header.frame_id, bx, by);
+        } catch (...) { return; }
+
+        float dist_diff = sqrt(pow(lx - bx, 2) + pow(ly - by, 2));
+        float target_x, target_y;
+
+        // Lógica de Fusión
+        if (dist_diff < MAX_STD_DEV) {
+            target_x = (lx * LEG_WEIGHT) + (bx * BODY_WEIGHT);
+            target_y = (ly * LEG_WEIGHT) + (by * BODY_WEIGHT);
+        } else {
+            // Si hay mucha discrepancia, confiamos en el cuerpo (Visión)
+            target_x = bx; target_y = by;
+        }
+
+        // TÉCNICA: Deadband (Evitar vibraciones en estático)
+        float move_step = sqrt(pow(target_x - last_target_x_, 2) + pow(target_y - last_target_y_, 2));
+        if (move_step < DEADBAND) {
+            target_x = last_target_x_;
+            target_y = last_target_y_;
+        }
+
+        // TÉCNICA: Filtro Paso Bajo (LPF) para suavidad
+        target_x = LPF_ALPHA * target_x + (1.0 - LPF_ALPHA) * last_target_x_;
+        target_y = LPF_ALPHA * target_y + (1.0 - LPF_ALPHA) * last_target_y_;
+
+        last_target_x_ = target_x;
+        last_target_y_ = target_y;
+
+        // Debug Point
+        geometry_msgs::msg::PointStamped dbg;
+        dbg.header.frame_id = "base_link";
+        dbg.header.stamp = this->get_clock()->now();
+        dbg.point.x = target_x; dbg.point.y = target_y; dbg.point.z = 0.5;
+        pub_debug_point_->publish(dbg);
+
+        // Control de Motores
+        geometry_msgs::msg::Twist cmd = calculate_speeds(target_x, target_y);
+        pub_cmd_vel_->publish(cmd);
     }
 
     void transform_to_robot_position(float x, float y, const std::string &frame_id,
@@ -147,93 +174,21 @@ private:
             Eigen::Vector3d v = e * Eigen::Vector3d(x, y, 0);
             x_out = v.x(); y_out = v.y();
         } catch (tf2::TransformException &ex) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "TF Error: %s", ex.what());
-            throw; 
-        }
-    }
-
-    void control_loop() {
-        if (!enable_) {
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Waiting for enable (true) on /hri/human_following/enable");
-            return;
-        }
-
-        auto now = this->get_clock()->now();
-        float final_x = 0.0, final_y = 0.0;
-        bool target_valid = false;
-
-        // 1. Validar tiempos
-        double legs_age = (now - last_legs_msg_.header.stamp).seconds() * 1000.0;
-        double body_age = (now - last_body_msg_.header.stamp).seconds() * 1000.0;
-
-        bool legs_ok = have_legs_ && legs_age < MAX_AGE_MS;
-        bool body_ok = have_body_ && body_age < MAX_AGE_MS;
-
-        // 2. Transformar
-        float lx, ly, bx, by;
-        try {
-            if (legs_ok) transform_to_robot_position(last_legs_msg_.point.x, last_legs_msg_.point.y, last_legs_msg_.header.frame_id, lx, ly);
-            if (body_ok) transform_to_robot_position(last_body_msg_.point.x, last_body_msg_.point.y, last_body_msg_.header.frame_id, bx, by);
-        } catch (...) { return; }
-
-        // 3. Fusión
-        if (legs_ok && body_ok) {
-            float dist = sqrt(pow(lx - bx, 2) + pow(ly - by, 2));
-            if (dist < MAX_STD_DEV) {
-                final_x = (lx * LEG_WEIGHT) + (bx * BODY_WEIGHT);
-                final_y = (ly * LEG_WEIGHT) + (by * BODY_WEIGHT);
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "FUSION: Legs + Body");
-            } else {
-                final_x = bx; final_y = by;
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "DISCREPANCY: Using Body");
-            }
-            target_valid = true;
-        } 
-        else if (legs_ok) { final_x = lx; final_y = ly; target_valid = true; RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Only Legs"); }
-        else if (body_ok) { final_x = bx; final_y = by; target_valid = true; RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Only Body"); }
-        else {
-             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 9000, "NO DATA (Age L: %.0fms, B: %.0fms)", legs_age, body_age);
-        }
-
-        if (target_valid) {
-            no_legs_ = 0;
-            // Publicar punto de Debug
-            geometry_msgs::msg::PointStamped dbg;
-            dbg.header.frame_id = "base_link"; dbg.header.stamp = now;
-            dbg.point.x = final_x; dbg.point.y = final_y; dbg.point.z = 0.5;
-            pub_debug_point_->publish(dbg);
-
-            geometry_msgs::msg::Twist cmd = calculate_speeds(final_x, final_y);
-            pub_cmd_vel_->publish(cmd);
-        } else {
-            if (++no_legs_ > 20) {
-                pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
-            }
+            throw std::runtime_error("TF Failure"); 
         }
     }
 
     geometry_msgs::msg::Twist calculate_speeds(float gx, float gy) {
         float angle_error = atan2(gy, gx);
-        float dist = sqrt(gx*gx + gy*gy);
-        dist -= dist_to_human_;
+        float dist = sqrt(gx*gx + gy*gy) - dist_to_human_;
         
         if (!move_backwards_ && dist < 0) dist = 0;
         if (dist > max_linear_) dist = max_linear_;
 
         geometry_msgs::msg::Twist result;
-        if (dist > 0 || (move_backwards_ && std::abs(dist) > 0.05)) {
+        if (dist > 0.02 || (move_backwards_ && std::abs(dist) > 0.05)) {
             result.linear.x = dist * exp(-(angle_error * angle_error) / control_alpha_);
-            result.linear.y = 0;
-            if (use_potfields_) result.linear.y = KInfRep_ * repulsiveForce_;
             result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
-        }
-        else {
-            result.linear.x = 0;
-            result.linear.y = 0;
-            if (fabs(angle_error) >= M_PI_4 / 6.0f)
-                result.angular.z = max_angular_ * (2 / (1 + exp(-angle_error / control_beta_)) - 1);
-            else
-                result.angular.z = 0;
         }
         return result;
     }
