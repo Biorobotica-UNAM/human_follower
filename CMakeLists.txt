@@ -15,15 +15,29 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(urg_node REQUIRED)
+find_package(std_srvs REQUIRED)
 
-
+#v1
 add_executable(leg_finder_node src/leg_finder_node.cpp)
 add_executable(human_follower_nodeV2 src/human_follower_nodeV2.cpp)
+
+#v2
+add_executable(leg_finder_nodev2 src/leg_finder_node.cpp)
 add_executable(human_follower_node src/human_follower_node.cpp)
 add_executable(human_tracking_node src/human_tracking_node.cpp)
 
 ament_target_dependencies(leg_finder_node
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  visualization_msgs
+  tf2_ros
+  tf2_eigen
+  Eigen3
+)
+
+ament_target_dependencies(leg_finder_nodev2
   rclcpp
   std_msgs
   sensor_msgs
@@ -63,10 +77,11 @@ ament_target_dependencies(human_tracking_node
 )
 
 install(TARGETS 
-  human_follower_node
   leg_finder_node
-  human_tracking_node
+  leg_finder_nodev2
+  human_follower_node
   human_follower_nodeV2
+  human_tracking_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

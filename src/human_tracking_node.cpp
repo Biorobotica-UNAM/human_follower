@@ -15,8 +15,13 @@ public:
         pub_lf_enable_ =this->create_publisher<std_msgs::msg::Bool>("/hri/leg_finder/enable", 1);
         pub_pt_enable_ = this->create_publisher<std_msgs::msg::Bool>("/enable_continuous", 1);
         
+<<<<<<< HEAD
         //pub_person_tracker_enable_ = this->create_publisher<std_msgs::msg::Bool>("/person_tracker/enable", 1);
         //pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
+=======
+
+        pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/vision/enable_continous", 1);
+>>>>>>> 07956fa8d2c4ee5a25f0cbe40ef1bd1002df4c38
         //pub_yd_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
 
         // Services
