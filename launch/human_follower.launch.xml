@@ -27,11 +27,15 @@
     <param name="move_backwards" value="false"/>
     <param name="enable_potfields" value="false"/>
     <param name="cmd_vel_topic" value="/hardware/base/cmd_vel"/>
-    <param name="person_pose_topic" value="/hardware/head/look_at"/>
+    <param name="person_pose_topic" value="/human_detection/target_point"/>
   </node>
 
   <!-- Pipeline handler node -->
   <node pkg="human_follower" exec="human_tracking_node" name="human_tracking_node" output="screen"/>
+
+  
+
+
 
 
 </launch>
