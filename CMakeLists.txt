@@ -16,6 +16,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(message_filters REQUIRED)
 
 #v1
 add_executable(leg_finder_node src/leg_finder_node.cpp)
@@ -64,6 +65,7 @@ ament_target_dependencies(human_follower_nodeV2
   std_msgs
   sensor_msgs
   geometry_msgs
+  message_filters
   visualization_msgs
   tf2_ros
   tf2_eigen
