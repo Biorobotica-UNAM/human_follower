@@ -16,7 +16,7 @@ public:
         pub_pt_enable_ = this->create_publisher<std_msgs::msg::Bool>("/enable_continuous", 1);
         
         //pub_person_tracker_enable_ = this->create_publisher<std_msgs::msg::Bool>("/person_tracker/enable", 1);
-        //pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
+        pub_human_detection_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
         //pub_yd_enable_ = this->create_publisher<std_msgs::msg::Bool>("/human_detection/enable", 1);
 
         // Services
@@ -30,12 +30,8 @@ public:
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_hf_enable_;
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_lf_enable_;
         //rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_person_tracker_enable_;
-<<<<<<< HEAD
-        //rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_human_detection_enable_;
-=======
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_human_detection_enable_;
->>>>>>> 7260320 (human follower)
-        //rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_yd_enable_;
+        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_pt_enable_;
         rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr human_tracking_srv_;
 
         bool enable_ = false;
