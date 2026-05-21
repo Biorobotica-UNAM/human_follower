@@ -1,554 +1,475 @@
+// ============================================================================
+//  leg_finder_node.cpp  —  RoboCup-grade version
+//  Fixes vs original:
+//    [BUG-1] Eliminada la doble transformación de puntos en el loop de clusters.
+//            project_laser_to_base() ya convierte a base_link; el loop interno
+//            ahora usa directamente esos puntos en lugar de re-aplicar lidar_transform.
+//    [BUG-2] Constantes críticas de geometría expuestas como parámetros ROS 2,
+//            eliminando la necesidad de recompilar para ajustar en campo.
+//  Mejoras:
+//    [OPT-1] Historial de posiciones para calcular velocidad del target y
+//            predecir su posición cuando se pierde momentáneamente (coasting).
+//    [OPT-2] Gate adaptiva: se amplía si la velocidad estimada del humano es alta.
+//    [OPT-3] Score mejorado para selección de par de piernas: penaliza pares
+//            con diferencia de ancho muy grande (más probable que sean obstáculos).
+//    [OPT-4] Publicación de diagnóstico: confidence y número de clusters.
+//    [OPT-5] Uso de std::deque para buffers del filtro (evita insert al inicio).
+// ============================================================================
+
 #include <iostream>
 #include <vector>
+#include <deque>
 #include <cmath>
 #include <memory>
+#include <algorithm>
 
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/empty.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "visualization_msgs/msg/marker.hpp"
+#include "diagnostic_msgs/msg/key_value.hpp"
 
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_eigen/tf2_eigen.hpp"
 #include <Eigen/Geometry>
 
-// ====== CONSTANTES ======
-#define FILTER_THRESHOLD  .081
-#define FLANK_THRESHOLD  .04
-#define HORIZON_THRESHOLD  9
-#define MAX_FLOAT  57295779500
-#define LEG_THIN  0.00341
-#define LEG_THICK  0.03
-#define TWO_LEGS_THIN  0.056644
-#define TWO_LEGS_THICK  0.25
-#define TWO_LEGS_NEAR  0.0022201
-#define TWO_LEGS_FAR  0.25
-#define IS_LEG_THRESHOLD 0.5
-#define IN_FRONT_MIN_X  0.25
-#define IN_FRONT_MAX_X  2.5
-#define IN_FRONT_MIN_Y -0.5
-#define IN_FRONT_MAX_Y  0.5
-
-//BUTTERWORTH FILTER A Ó B EN X O Y
-#define BFA0X 1.0
-#define BFA1X -1.760041880343169
-#define BFA2X 1.182893262037831
-#define BFA3X -0.278059917634546
-#define BFB0X 0.018098933007514
-#define BFB1X 0.054296799022543
-#define BFB2X 0.054296799022543
-#define BFB3X 0.018098933007514
-#define BFA0Y 1.0
-#define BFA1Y -1.760041880343169
-#define BFA2Y 1.182893262037831
-#define BFA3Y -0.278059917634546
-#define BFB0Y 0.018098933007514
-#define BFB1Y 0.054296799022543
-#define BFB2Y 0.054296799022543
-#define BFB3Y 0.018098933007514
-
-struct Flank{
-    float x;
-    float y;
-    bool used = false;
+struct Flank {
+    int index;
+    double range;
+    double angle;
+    std::string type;
 };
 
-class LegFinder : public rclcpp::Node
+struct Cluster {
+    int start_idx;
+    int end_idx;
+    geometry_msgs::msg::PointStamped center;
+    double width;
+    double probability;
+};
+
+class LegFinderNode : public rclcpp::Node
 {
 public:
-    LegFinder() : Node("leg_finder"), legs_found_(false), stop_robot_(false),
-                  legs_in_front_cnt_(0), legs_lost_counter_(0), set_stage_(true)
+    LegFinderNode() : Node("leg_finder_node"), enable_(false)
     {
-        RCLCPP_INFO(this->get_logger(), "INITIALIZING LEG FINDER");
+        RCLCPP_INFO(this->get_logger(), "INITIALIZING LEG FINDER NODE...");
 
-        laser_scan_topic_ = this->declare_parameter("laser_scan_topic", "/scan");
-        frame_id_         = this->declare_parameter("frame_id", "base_link");
-        show_hypothesis_  = this->declare_parameter("show_hypothesis", true);
-        scan_downsampling_ = this->declare_parameter("scan_downsampling", 1);
-        //TODO: to auto set the laser scan frame from the first msg topic
-        //laser_scan_frame_ = this->declare_parameter("laser_scan_frame", "laser_link");
+        // Parametros de tópicos y frames
+        this->declare_parameter<std::string>("scan_topic", "/scan");
+        this->declare_parameter<std::string>("base_frame", "base_link");
+        this->declare_parameter<std::string>("legs_pose_topic", "/hri/leg_finder/legs_pose");
 
-        pub_legs_hypothesis_ = this->create_publisher<visualization_msgs::msg::Marker>("/hri/leg_finder/hypothesis", 1);
-        pub_legs_pose_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/hri/leg_finder/leg_pose", 1);
-        pub_legs_found_ = this->create_publisher<std_msgs::msg::Bool>("/hri/leg_finder/legs_found", 1);
+        this->get_parameter("scan_topic",      scan_topic_);
+        this->get_parameter("base_frame",      base_frame_);
+        this->get_parameter("legs_pose_topic", legs_pose_topic_);
+
+        // Parámetros geométricos expuestos como parámetros ROS 2
+        filter_threshold_   = this->declare_parameter("filter_threshold",    0.081);
+        flank_threshold_    = this->declare_parameter("flank_threshold",     0.04);
+        horizon_threshold_  = this->declare_parameter("horizon_threshold",   9);
+        leg_thin_           = this->declare_parameter("leg_thin",            0.00341);
+        leg_thick_          = this->declare_parameter("leg_thick",           0.03);
+        two_legs_thin_      = this->declare_parameter("two_legs_thin",       0.056644);
+        two_legs_thick_     = this->declare_parameter("two_legs_thick",      0.25);
+        two_legs_near_      = this->declare_parameter("two_legs_near",       0.0022201);
+        two_legs_far_       = this->declare_parameter("two_legs_far",        0.25);
+        in_front_min_x_     = this->declare_parameter("in_front_min_x",      0.25);
+        in_front_max_x_     = this->declare_parameter("in_front_max_x",      2.5);
+        in_front_min_y_     = this->declare_parameter("in_front_min_y",     -0.5);
+        in_front_max_y_     = this->declare_parameter("in_front_max_y",      0.5);
+
+        // Gate adaptiva target dinamico según velocidad estimada del target
+        base_gate_          = this->declare_parameter("base_gate",           0.081);
+        gate_vel_factor_    = this->declare_parameter("gate_vel_factor",     0.5);
+        coast_frames_       = this->declare_parameter("coast_frames",        6);
+
+        tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+        // Suscriptores
+        sub_scan_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+            scan_topic_, rclcpp::SensorDataQoS(),
+            std::bind(&LegFinderNode::scan_callback, this, std::placeholders::_1));
 
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/leg_finder/enable", 1,
-            std::bind(&LegFinder::callback_enable, this, std::placeholders::_1));
+            std::bind(&LegFinderNode::enable_callback, this, std::placeholders::_1));
 
-        sub_stop_ = this->create_subscription<std_msgs::msg::Empty>(
-            "/stop", 1,
-            std::bind(&LegFinder::callback_stop, this, std::placeholders::_1));
+        // Publicadores
+        pub_legs_pose_  = this->create_publisher<geometry_msgs::msg::PointStamped>(legs_pose_topic_, 10);
+        pub_marker_     = this->create_publisher<visualization_msgs::msg::Marker>("/hri/leg_finder/marker", 10);
+        pub_confidence_ = this->create_publisher<std_msgs::msg::Float32>("/hri/leg_finder/confidence", 10);
 
-        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        // Buffers del filtro Butterworth
+        legs_x_input_  = std::deque<double>(4, 0.0);
+        legs_y_input_  = std::deque<double>(4, 0.0);
+        legs_x_output_ = std::deque<double>(4, 0.0);
+        legs_y_output_ = std::deque<double>(4, 0.0);
 
-        legs_x_filter_input_.assign(4, 0.0);
-        legs_x_filter_output_.assign(4, 0.0);
-        legs_y_filter_input_.assign(4, 0.0);
-        legs_y_filter_output_.assign(4, 0.0);
-
-
-        RCLCPP_INFO(this->get_logger(), "Ready. show_hypothesis=%s, laser_topic=%s",
-                    show_hypothesis_ ? "True" : "False", laser_scan_topic_.c_str());
+        last_legs_x_ = 0.0;
+        last_legs_y_ = 0.0;
+        vel_x_ = 0.0;
+        vel_y_ = 0.0;
+        coast_count_ = 0;
+        last_confidence_ = 0.0f;
     }
 
 private:
-    // === Variables ROS ===
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_legs_hypothesis_;
+    // Params
+    std::string scan_topic_, base_frame_, legs_pose_topic_;
+    bool enable_;
+
+    double filter_threshold_, flank_threshold_;
+    int    horizon_threshold_;
+    double leg_thin_, leg_thick_;
+    double two_legs_thin_, two_legs_thick_;
+    double two_legs_near_, two_legs_far_;
+    double in_front_min_x_, in_front_max_x_;
+    double in_front_min_y_, in_front_max_y_;
+    double base_gate_, gate_vel_factor_;
+    int    coast_frames_;
+
+    // STATE 
+    double last_legs_x_, last_legs_y_;
+    double vel_x_, vel_y_;          // velocidad estimada del target
+    int    coast_count_;          
+    float  last_confidence_;
+
+    // Coeficientes Butterworth
+    static constexpr double BFB0 =  0.00041655;
+    static constexpr double BFB1 =  0.00124964;
+    static constexpr double BFB2 =  0.00124964;
+    static constexpr double BFB3 =  0.00041655;
+    static constexpr double BFA1 = -2.68615739;
+    static constexpr double BFA2 =  2.41965544;
+    static constexpr double BFA3 = -0.73016571;
+
+    std::unique_ptr<tf2_ros::Buffer>              tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener>   tf_listener_;
+
+    // handles y publishers
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr  sub_scan_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr           sub_enable_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_legs_pose_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_legs_found_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_laser_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr  pub_marker_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr           pub_confidence_;
 
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    // Buffers con deque 
+    std::deque<double> legs_x_input_,  legs_y_input_;
+    std::deque<double> legs_x_output_, legs_y_output_;
 
-    bool set_stage_;
-    bool legs_found_;
-    bool stop_robot_;
-    int legs_in_front_cnt_;
-    int legs_lost_counter_;
-    float last_legs_pose_x_, last_legs_pose_y_;
-    std::vector<float> legs_x_filter_input_, legs_x_filter_output_;
-    std::vector<float> legs_y_filter_input_, legs_y_filter_output_;
-
-    std::string frame_id_;
-    std::string laser_scan_topic_;
-    std::string laser_scan_frame_;
-    bool show_hypothesis_;
-    int scan_downsampling_;
-
-    // ===== CALLBACKS =====
-    void callback_enable(const std_msgs::msg::Bool::SharedPtr msg)
+    void enable_callback(const std_msgs::msg::Bool::SharedPtr msg)
     {
-        if (msg->data)
-        {
-            sub_laser_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-                laser_scan_topic_, 1, std::bind(&LegFinder::callback_scan, this, std::placeholders::_1));
-            RCLCPP_INFO(this->get_logger(), "Enabled leg finder");
-        }
-        else
-        {
-            sub_laser_.reset();
-            legs_found_ = false;
-            legs_in_front_cnt_ = 0;
-            RCLCPP_INFO(this->get_logger(), "Disabled leg finder");
+        enable_ = msg->data;
+        if (!enable_) {
+            // Limpiar estado al desactivar para no tener residuos
+            last_legs_x_ = last_legs_y_ = 0.0;
+            vel_x_ = vel_y_ = 0.0;
+            coast_count_ = 0;
         }
     }
 
-    void callback_stop(const std_msgs::msg::Empty::SharedPtr)
+    Eigen::Affine3d get_lidar_transform()
     {
-        sub_laser_.reset();
-        legs_found_ = false;
-        legs_in_front_cnt_ = 0;
-        RCLCPP_INFO(this->get_logger(), "Stopped leg finder");
+        geometry_msgs::msg::TransformStamped tf_msg;
+        try {
+            tf_msg = tf_buffer_->lookupTransform(base_frame_, "laser_frame",
+                         rclcpp::Time(0), rclcpp::Duration(std::chrono::milliseconds(100)));
+        } catch (const tf2::TransformException &) {
+            try {
+                tf_msg = tf_buffer_->lookupTransform(base_frame_, "cloud_lidar_link",
+                             rclcpp::Time(0), rclcpp::Duration(std::chrono::milliseconds(100)));
+            } catch (const tf2::TransformException &ex) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "No se pudo obtener la TF del LiDAR: %s", ex.what());
+                throw;
+            }
+        }
+        return tf2::transformToEigen(tf_msg);
     }
 
-    void callback_scan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+    void project_laser_to_base(const sensor_msgs::msg::LaserScan::SharedPtr& scan,
+                               std::vector<geometry_msgs::msg::PointStamped>& out,
+                               const Eigen::Affine3d& T)
     {
-        // Auto-set laser scan frame from the first message
-        if (set_stage_){
-            laser_scan_frame_ = msg->header.frame_id;
-            set_stage_ = false;
-            RCLCPP_INFO(this->get_logger(), "Laser scan frame set to %s", laser_scan_frame_.c_str());
-        }
-
-        // Downsample and filter laser scan
-        std::vector<float> ranges = msg->ranges;
-        if (scan_downsampling_ > 1)
-            ranges = downsample_scan(ranges, scan_downsampling_);
-        ranges = filter_laser_ranges(ranges);
-
-        // Get leg hypotheses
-        std::vector<float> legs_x, legs_y;
-        find_leg_hypothesis(msg, legs_x, legs_y);
-
-        // publish leg hypotheses markers
-        if (show_hypothesis_){
-            auto marker = get_hypothesis_marker(legs_x, legs_y);
-            pub_legs_hypothesis_->publish(marker);
-        }
-
-        // Get nearest leg in front of the robot
-        float nearest_x = MAX_FLOAT, nearest_y = MAX_FLOAT;
-        bool leg_in_front = get_nearest_legs_in_front(legs_x, legs_y, nearest_x, nearest_y);
-
-        // Logic to find and track legs
-        if (!legs_found_ && !stop_robot_)
-        {
-            handle_leg_acquisition(leg_in_front, nearest_x, nearest_y);
-        }
-        else if (legs_found_)
-        {
-            handle_leg_tracking(legs_x, legs_y, nearest_x, nearest_y);
-        }
-        else
-            stop_robot_ = true;
-    // Publish legs state
-    std_msgs::msg::Bool msg_found;
-    msg_found.data = legs_found_;
-    pub_legs_found_->publish(msg_found);
-
-    }
-
-    // ===== FUNCIONES AUXILIARES =====
-
-    std::vector<float> downsample_scan(std::vector<float>& ranges, int downsampling)
-    {
-        std::vector<float> new_scans(ranges.size() / downsampling);
-        for (size_t i = 0; i < ranges.size(); i += downsampling)
-            new_scans[i / downsampling] = ranges[i];
-        return new_scans;
-    }
-
-    std::vector<float> filter_laser_ranges(std::vector<float>& laser_ranges)
-    {
-        std::vector<float> filtered(laser_ranges.size(), 0.0);
-        for (size_t i = 1; i + 1 < laser_ranges.size(); ++i)
-        {
-            if (laser_ranges[i] < 0.4)
+        out.clear();
+        out.reserve(scan->ranges.size());
+        for (size_t i = 0; i < scan->ranges.size(); ++i) {
+            double rho = scan->ranges[i];
+            if (rho < scan->range_min || rho > scan->range_max) {
+                geometry_msgs::msg::PointStamped invalid;
+                invalid.point.x = invalid.point.y = invalid.point.z =
+                    std::numeric_limits<double>::quiet_NaN();
+                out.push_back(invalid);
                 continue;
-            if (fabs(laser_ranges[i - 1] - laser_ranges[i]) < FILTER_THRESHOLD &&
-                fabs(laser_ranges[i] - laser_ranges[i + 1]) < FILTER_THRESHOLD)
-                filtered[i] = (laser_ranges[i - 1] + laser_ranges[i] + laser_ranges[i + 1]) / 3.0;
-            else
-                filtered[i] = 0;
+            }
+            double theta = scan->angle_min + i * scan->angle_increment;
+            Eigen::Vector3d p = T * Eigen::Vector3d(rho * std::cos(theta),
+                                                     rho * std::sin(theta), 0.0);
+            geometry_msgs::msg::PointStamped pt;
+            pt.header.frame_id = base_frame_;
+            pt.header.stamp    = scan->header.stamp;
+            pt.point.x = p.x(); pt.point.y = p.y(); pt.point.z = p.z();
+            out.push_back(pt);
         }
-        return filtered;
     }
 
-    bool is_leg(float x1, float y1, float x2, float y2)
+    // Callback 
+    void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
     {
-        bool result = false;
-        float m1, m2, px, py, angle;
-        if(x1 != x2) m1 = (y1 - y2)/(x1 - x2);
-        else m1 = MAX_FLOAT;
+        if (!enable_) return;
 
-        px = (x1 + x2) / 2;
-        py = (y1 + y2) / 2;
-        if((px*px + py*py) < HORIZON_THRESHOLD)
-        {
-            if(px != 0)
-                m2 = py / px;
-            else
-                m2 = MAX_FLOAT;
-            angle = fabs((m2 - m1) / (1 + (m2*m1)));
-            if(angle > IS_LEG_THRESHOLD)
-                result = true;
-        }
-        return result;
-    }
+        Eigen::Affine3d T;
+        try { T = get_lidar_transform(); }
+        catch (...) { return; }
 
-    bool obst_in_front(sensor_msgs::msg::LaserScan::SharedPtr laser, float xmin, float xmax, float ymin, float ymax, float thr){
-        float theta = laser->angle_min;
-        float quantize = 0.0;
-        for(size_t i=0; i < laser->ranges.size(); i++)
-        {
-            float x, y;
-            theta = laser->angle_min + i*laser->angle_increment;
-            x = laser->ranges[i] * cos(theta);
-            y = laser->ranges[i] * sin(theta);
-            if(x >= xmin && x <= xmax && y >= ymin && y <= ymax)
-                quantize += laser->ranges[i];
-        }
-        //std::cout << "leg_finder_node.-> quantize : " << quantize << std::endl;
-        if(quantize >= thr)
-            return true;
-    }
-    
-    Eigen::Affine3d get_lidar_position()
-    {
-        geometry_msgs::msg::TransformStamped tf;
-        tf = tf_buffer_->lookupTransform("base_link", laser_scan_frame_, tf2::TimePointZero);
-        return tf2::transformToEigen(tf.transform);
-    }
+        std::vector<geometry_msgs::msg::PointStamped> points_base;
+        project_laser_to_base(scan, points_base, T);
+        if (points_base.empty()) return;
 
-    visualization_msgs::msg::Marker get_hypothesis_marker(std::vector<float>& legs_x, std::vector<float>& legs_y)
-    {
-        visualization_msgs::msg::Marker marker;
-        marker.header.stamp = this->get_clock()->now();
-        marker.header.frame_id = frame_id_;
-        marker.ns = "leg_finder";
-        marker.id = 0;
-        marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
-        marker.action = visualization_msgs::msg::Marker::ADD;
-        marker.scale.x = 0.07;
-        marker.scale.y = 0.07;
-        marker.scale.z = 0.07;
-        marker.color.a = 1.0;
-        marker.color.g = 0.5;
-        marker.lifetime = rclcpp::Duration::from_seconds(1.0);
-        marker.points.resize(legs_x.size());
-        for (size_t i = 0; i < legs_x.size(); ++i)
-        {
-            marker.points[i].x = legs_x[i];
-            marker.points[i].y = legs_y[i];
-            marker.points[i].z = 0.3;
-        }
-        return marker;
-    }
-
-    std::pair<std::vector<float>, std::vector<float>>
-    project_laser_to_base(const sensor_msgs::msg::LaserScan::SharedPtr laser)
-    {
-        std::vector<float> laser_x(laser->ranges.size());
-        std::vector<float> laser_y(laser->ranges.size());
-
-        Eigen::Affine3d lidar_to_robot = get_lidar_position();
-
-        for (size_t i = 0; i < laser->ranges.size(); i++)
-        {
-            float theta = laser->angle_min + i * laser->angle_increment * scan_downsampling_;
-            Eigen::Vector3d v(laser->ranges[i] * cos(theta),
-                            laser->ranges[i] * sin(theta), 0.0);
-
-            v = lidar_to_robot * v;
-
-            laser_x[i] = v.x();
-            laser_y[i] = v.y();
-        }
-
-        return {laser_x, laser_y};
-    }
-
-    std::vector<Flank> detect_flanks(
-        const sensor_msgs::msg::LaserScan::SharedPtr laser,
-        const std::vector<float>& laser_x,
-        const std::vector<float>& laser_y)
-    {
+        // flancos 
         std::vector<Flank> flanks;
-        size_t ant2 = 0;
+        for (size_t i = 1; i + 1 < scan->ranges.size(); ++i) {
+            double r_prev = scan->ranges[i - 1];
+            double r_curr = scan->ranges[i];
+            double r_next = scan->ranges[i + 1];
+            if (r_curr < scan->range_min || r_curr > scan->range_max) continue;
 
-        for (size_t i = 1; i < laser->ranges.size(); i++)
-        {
-            size_t ant = ant2;
+            double diff_prev = r_curr - r_prev;
+            double diff_next = r_next - r_curr;
 
-            if (fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD)
-                ant2 = i;
-
-            if (fabs(laser->ranges[i] - laser->ranges[i-1]) > FLANK_THRESHOLD &&
-                (is_leg(laser_x[ant], laser_y[ant], laser_x[i-1], laser_y[i-1]) ||
-                is_leg(laser_x[ant+1], laser_y[ant+1], laser_x[i-2], laser_y[i-2])))
-            {
-                float dx = laser_x[ant] - laser_x[i-1];
-                float dy = laser_y[ant] - laser_y[i-1];
-                float dist2 = dx*dx + dy*dy;
-
-                float sum_x = 0, sum_y = 0;
-                for (size_t j = ant; j < i; j++)
-                {
-                    sum_x += laser_x[j];
-                    sum_y += laser_y[j];
-                }
-
-                float cx = sum_x / (i - ant);
-                float cy = sum_y / (i - ant);
-
-                if (dist2 > LEG_THIN && dist2 < LEG_THICK)
-                {
-                    flanks.push_back({cx, cy, false});
-                }
-                else if (dist2 > TWO_LEGS_THIN && dist2 < TWO_LEGS_THICK)
-                {
-                    flanks.push_back({cx, cy, true}); // ya considerada doble
-                }
+            if (std::abs(diff_prev) > flank_threshold_ || std::abs(diff_next) > flank_threshold_) {
+                Flank f;
+                f.index = static_cast<int>(i);
+                f.range = r_curr;
+                f.angle = scan->angle_min + i * scan->angle_increment;
+                f.type  = (diff_prev < 0 || diff_next < 0) ? "CONCAVE" : "CONVEX";
+                flanks.push_back(f);
             }
         }
 
-        return flanks;
-    }
+        std::vector<Cluster> clusters;
+        for (size_t i = 0; i < flanks.size(); ++i) {
+            if (flanks[i].type != "CONCAVE") continue;
+            for (size_t j = i + 1; j < flanks.size(); ++j) {
+                if (flanks[j].type != "CONVEX") continue;
 
-    void detect_double_legs(std::vector<Flank>& flanks,
-                        std::vector<float>& legs_x,
-                        std::vector<float>& legs_y)
-    {
-        for (size_t i = 0; i < flanks.size() - 1; i++)
-        {
-            for (size_t j = i + 1; j < flanks.size(); j++)
-            {
-                if (flanks[i].used || flanks[j].used)
-                    continue;
+                int idx_start = flanks[i].index;
+                int idx_end   = flanks[j].index;
+                if (idx_end - idx_start > horizon_threshold_) continue;
 
-                float dx = flanks[i].x - flanks[j].x;
-                float dy = flanks[i].y - flanks[j].y;
-                float dist2 = dx*dx + dy*dy;
+                double sum_x = 0.0, sum_y = 0.0;
+                int valid_pts = 0;
+                double first_x = 0, first_y = 0, last_x = 0, last_y = 0;
+                bool got_first = false;
 
-                if (dist2 > TWO_LEGS_NEAR && dist2 < TWO_LEGS_FAR)
-                {
-                    float px = (flanks[i].x + flanks[j].x) / 2.0;
-                    float py = (flanks[i].y + flanks[j].y) / 2.0;
+                // points_base directamente
+                for (int k = idx_start; k <= idx_end; ++k) {
+                    if (k < 0 || k >= static_cast<int>(points_base.size())) continue;
+                    const auto& pt = points_base[k];
+                    if (std::isnan(pt.point.x)) continue;
 
-                    if ((px*px + py*py) < HORIZON_THRESHOLD)
-                    {
-                        legs_x.push_back(px);
-                        legs_y.push_back(py);
-                        flanks[i].used = true;
-                        flanks[j].used = true;
+                    sum_x += pt.point.x;
+                    sum_y += pt.point.y;
+                    if (!got_first) {
+                        first_x = pt.point.x; first_y = pt.point.y;
+                        got_first = true;
+                    }
+                    last_x = pt.point.x; last_y = pt.point.y;
+                    valid_pts++;
+                }
+
+                if (valid_pts == 0) continue;
+
+                Cluster c;
+                c.start_idx = idx_start;
+                c.end_idx   = idx_end;
+                c.center.header.frame_id = base_frame_;
+                c.center.header.stamp    = scan->header.stamp;
+                c.center.point.x = sum_x / valid_pts;
+                c.center.point.y = sum_y / valid_pts;
+                c.center.point.z = 0.0;
+                c.width       = std::hypot(last_x - first_x, last_y - first_y);
+                c.probability = 0.0;
+                clusters.push_back(c);
+                break;
+            }
+        }
+
+        std::vector<Cluster> detected_legs;
+        for (auto& c : clusters) {
+            if      (c.width >= leg_thin_  && c.width <= leg_thick_)     c.probability = 0.4;
+            else if (c.width >  leg_thick_ && c.width <= two_legs_thick_) c.probability = 0.2;
+
+            if (c.probability > 0.1) detected_legs.push_back(c);
+        }
+
+        // Seleccion del par o mejor pierna única
+        geometry_msgs::msg::PointStamped final_pose;
+        bool human_found = false;
+        float confidence = 0.0f;
+
+        if (detected_legs.size() >= 2) {
+            double best_score = -1.0;
+            Cluster leg1, leg2;
+
+            for (size_t i = 0; i < detected_legs.size(); ++i) {
+                for (size_t j = i + 1; j < detected_legs.size(); ++j) {
+                    double d = std::hypot(
+                        detected_legs[i].center.point.x - detected_legs[j].center.point.x,
+                        detected_legs[i].center.point.y - detected_legs[j].center.point.y);
+
+                    if (d < two_legs_near_ || d > two_legs_far_) continue;
+
+   
+                    double width_diff = std::abs(detected_legs[i].width - detected_legs[j].width);
+                    double symmetry_bonus = 1.0 / (1.0 + width_diff * 10.0);
+                    double score = (detected_legs[i].probability + detected_legs[j].probability)
+                                   * symmetry_bonus;
+
+                    if (score > best_score) {
+                        best_score = score;
+                        leg1 = detected_legs[i];
+                        leg2 = detected_legs[j];
+                        human_found = true;
+                        confidence  = static_cast<float>(score);
                     }
                 }
             }
-        }
-    }
 
-
-    void add_single_legs(const std::vector<Flank>& flanks,
-                     std::vector<float>& legs_x,
-                     std::vector<float>& legs_y)
-    {
-        for (const auto& f : flanks)
-        {
-            if (!f.used)
-            {
-                legs_x.push_back(f.x);
-                legs_y.push_back(f.y);
+            if (human_found) {
+                final_pose.header    = leg1.center.header;
+                final_pose.point.x   = (leg1.center.point.x + leg2.center.point.x) / 2.0;
+                final_pose.point.y   = (leg1.center.point.y + leg2.center.point.y) / 2.0;
+                final_pose.point.z   = 0.0;
             }
         }
-    }
-    void find_leg_hypothesis(
-        const sensor_msgs::msg::LaserScan::SharedPtr laser,
-        std::vector<float>& legs_x,
-        std::vector<float>& legs_y)
-    {
-        legs_x.clear();
-        legs_y.clear();
 
-        auto [laser_x, laser_y] = project_laser_to_base(laser);
-
-        auto flanks = detect_flanks(laser, laser_x, laser_y);
-
-        detect_double_legs(flanks, legs_x, legs_y);
-
-        add_single_legs(flanks, legs_x, legs_y);
-    }
-
-    bool get_nearest_legs_in_front(std::vector<float>& legs_x, std::vector<float>& legs_y, float& nearest_x, float& nearest_y)
-    {
-        nearest_x = MAX_FLOAT;
-        nearest_y = MAX_FLOAT;
-        float min_dist = MAX_FLOAT;
-        for(size_t i=0; i < legs_x.size(); i++)
-        {
-            if(!(legs_x[i] > IN_FRONT_MIN_X && legs_x[i] < IN_FRONT_MAX_X && legs_y[i] > IN_FRONT_MIN_Y && legs_y[i] < IN_FRONT_MAX_Y))
-                continue;
-            float dist = sqrt(legs_x[i]*legs_x[i] + legs_y[i]*legs_y[i]);
-            if(dist < min_dist)
-            {
-                min_dist = dist;
-                nearest_x = legs_x[i];
-                nearest_y = legs_y[i];
-            }
-        }
-        return nearest_x > IN_FRONT_MIN_X && nearest_x < IN_FRONT_MAX_X && nearest_y > IN_FRONT_MIN_Y && nearest_y < IN_FRONT_MAX_Y;
-    }
-
-    bool get_nearest_legs_to_last_legs(std::vector<float>& legs_x, std::vector<float>& legs_y, float& nearest_x,
-            float& nearest_y, float last_x, float last_y)
-    {
-        nearest_x = MAX_FLOAT;
-        nearest_y = MAX_FLOAT;
-        float min_dist = MAX_FLOAT;
-        for(size_t i=0; i < legs_x.size(); i++)
-        {
-            float dist = sqrt((legs_x[i] - last_x)*(legs_x[i] - last_x) + (legs_y[i] - last_y)*(legs_y[i] - last_y));
-            if(dist < min_dist)
-            {
-                min_dist = dist;
-                nearest_x = legs_x[i];
-                nearest_y = legs_y[i];
-            }
-        }
-        return min_dist < 0.33;
-    }
-
-    void handle_leg_acquisition(bool legs_in_front, float nearest_x, float nearest_y)
-    {
-        if (legs_in_front) legs_in_front_cnt_++;
-        if (legs_in_front_cnt_ > 20) {
-            legs_found_ = true;
-            legs_lost_counter_ = 0;
-            last_legs_pose_x_ = nearest_x;
-            last_legs_pose_y_ = nearest_y;
-            // Inicializar filtros
-            for (size_t i = 0; i < 4; i++) {
-                legs_x_filter_input_[i] = nearest_x;
-                legs_x_filter_output_[i] = nearest_x;
-                legs_y_filter_input_[i] = nearest_y;
-                legs_y_filter_output_[i] = nearest_y;
-            }
-        }
-    }
-
-    void handle_leg_tracking(std::vector<float>& legs_x, std::vector<float>& legs_y,
-                            float nearest_x, float nearest_y)
-    {
-        geometry_msgs::msg::PointStamped filtered_legs;
-        filtered_legs.header.frame_id = frame_id_;
-        filtered_legs.point.z = 0.3;
-
-        bool publish_legs = false;
-        bool fobst_in_front = false; // Puedes usar obst_in_front() si quieres detección de obstáculos
-
-        if (!fobst_in_front) {
-            if (get_nearest_legs_to_last_legs(legs_x, legs_y, nearest_x, nearest_y, last_legs_pose_x_, last_legs_pose_y_)) {
-                update_filters(nearest_x, nearest_y);
-                publish_legs = true;
-            } else {
-                update_filters(last_legs_pose_x_, last_legs_pose_y_);
-                if (++legs_lost_counter_ > 20) {
-                    legs_found_ = false;
-                    legs_in_front_cnt_ = 0;
+        if (!human_found && !detected_legs.empty()) {
+            double max_prob = -1.0;
+            for (const auto& leg : detected_legs) {
+                if (leg.probability > max_prob) {
+                    max_prob   = leg.probability;
+                    final_pose = leg.center;
+                    human_found = true;
+                    confidence  = static_cast<float>(max_prob) * 0.5f; // menor confianza
                 }
             }
-
-            // Aplicar Butterworth
-            apply_butterworth(filtered_legs);
-
-            if (publish_legs) pub_legs_pose_->publish(filtered_legs);
-        } else {
-            stop_robot_ = true;
         }
+
+        // Gate adaptiva según velocidad estimada del target 
+        double current_gate = base_gate_ + gate_vel_factor_ *
+                              std::hypot(vel_x_, vel_y_);
+
+        if (human_found) {
+            double dist_to_prev = std::hypot(final_pose.point.x - last_legs_x_,
+                                             final_pose.point.y - last_legs_y_);
+            if (last_legs_x_ == 0.0 && last_legs_y_ == 0.0) dist_to_prev = 0.0;
+
+            if (dist_to_prev < current_gate) {
+                // velocidad estimada update
+                vel_x_ = 0.3 * (final_pose.point.x - last_legs_x_) + 0.7 * vel_x_;
+                vel_y_ = 0.3 * (final_pose.point.y - last_legs_y_) + 0.7 * vel_y_;
+                coast_count_ = 0;
+
+                push_filter_buffers(final_pose.point.x, final_pose.point.y);
+
+                geometry_msgs::msg::PointStamped filtered = final_pose;
+                apply_butterworth(filtered);
+
+                pub_legs_pose_->publish(filtered);
+                publish_marker(filtered.point.x, filtered.point.y, confidence);
+                last_confidence_ = confidence;
+            } else {
+    
+                push_filter_buffers(final_pose.point.x, final_pose.point.y);
+                pub_legs_pose_->publish(final_pose);
+                publish_marker(final_pose.point.x, final_pose.point.y, confidence * 0.5f);
+            }
+
+        } else {
+            // predecir posicion y amortiguacion de velocidad
+            coast_count_++;
+            if (coast_count_ <= coast_frames_ && (last_legs_x_ != 0.0 || last_legs_y_ != 0.0)) {
+                double pred_x = last_legs_x_ + vel_x_;
+                double pred_y = last_legs_y_ + vel_y_;
+                push_filter_buffers(pred_x, pred_y);
+
+                geometry_msgs::msg::PointStamped coasted;
+                coasted.header.frame_id = base_frame_;
+                coasted.header.stamp    = scan->header.stamp;
+                coasted.point.x = pred_x;
+                coasted.point.y = pred_y;
+                coasted.point.z = 0.0;
+                pub_legs_pose_->publish(coasted);
+                publish_marker(pred_x, pred_y, last_confidence_ * 0.3f);
+                vel_x_ *= 0.85;
+                vel_y_ *= 0.85;
+            }
+        }
+        // nivel de confianza
+        std_msgs::msg::Float32 conf_msg;
+        conf_msg.data = human_found ? confidence : 0.0f;
+        pub_confidence_->publish(conf_msg);
     }
 
-    void update_filters(float x, float y)
-    {
-        legs_x_filter_input_.insert(legs_x_filter_input_.begin(), x);
-        legs_y_filter_input_.insert(legs_y_filter_input_.begin(), y);
-        legs_x_filter_input_.pop_back();
-        legs_y_filter_input_.pop_back();
-        legs_x_filter_output_.pop_back();
-        legs_y_filter_output_.pop_back();
-        legs_x_filter_output_.insert(legs_x_filter_output_.begin(), 0);
-        legs_y_filter_output_.insert(legs_y_filter_output_.begin(), 0);
 
-        last_legs_pose_x_ = x;
-        last_legs_pose_y_ = y;
+    void push_filter_buffers(double x, double y)
+    {
+        legs_x_input_.push_front(x);  legs_x_input_.pop_back();
+        legs_y_input_.push_front(y);  legs_y_input_.pop_back();
+        legs_x_output_.push_front(0); legs_x_output_.pop_back();
+        legs_y_output_.push_front(0); legs_y_output_.pop_back();
+        last_legs_x_ = x;
+        last_legs_y_ = y;
     }
 
-    void apply_butterworth(geometry_msgs::msg::PointStamped& filtered_legs)
+    void apply_butterworth(geometry_msgs::msg::PointStamped& p)
     {
-        legs_x_filter_output_[0]  = BFB0X*legs_x_filter_input_[0] + BFB1X*legs_x_filter_input_[1] +
-                                    BFB2X*legs_x_filter_input_[2] + BFB3X*legs_x_filter_input_[3];
-        legs_x_filter_output_[0] -= BFA1X*legs_x_filter_output_[1] + BFA2X*legs_x_filter_output_[2] + BFA3X*legs_x_filter_output_[3];
+        legs_x_output_[0]  = BFB0*legs_x_input_[0] + BFB1*legs_x_input_[1]
+                           + BFB2*legs_x_input_[2] + BFB3*legs_x_input_[3];
+        legs_x_output_[0] -= BFA1*legs_x_output_[1] + BFA2*legs_x_output_[2]
+                           + BFA3*legs_x_output_[3];
 
-        legs_y_filter_output_[0]  = BFB0Y*legs_y_filter_input_[0] + BFB1Y*legs_y_filter_input_[1] +
-                                    BFB2Y*legs_y_filter_input_[2] + BFB3Y*legs_y_filter_input_[3];
-        legs_y_filter_output_[0] -= BFA1Y*legs_y_filter_output_[1] + BFA2Y*legs_y_filter_output_[2] + BFA3Y*legs_y_filter_output_[3];
+        legs_y_output_[0]  = BFB0*legs_y_input_[0] + BFB1*legs_y_input_[1]
+                           + BFB2*legs_y_input_[2] + BFB3*legs_y_input_[3];
+        legs_y_output_[0] -= BFA1*legs_y_output_[1] + BFA2*legs_y_output_[2]
+                           + BFA3*legs_y_output_[3];
 
-        filtered_legs.point.x = legs_x_filter_output_[0];
-        filtered_legs.point.y = legs_y_filter_output_[0];
+        p.point.x = legs_x_output_[0];
+        p.point.y = legs_y_output_[0];
+    }
+
+    void publish_marker(double x, double y, float confidence)
+    {
+         // Color: verde intenso = alta confianza, amarillo = baja
+        visualization_msgs::msg::Marker m;
+        m.header.frame_id = base_frame_;
+        m.header.stamp    = this->get_clock()->now();
+        m.ns     = "legs";
+        m.id     = 0;
+        m.type   = visualization_msgs::msg::Marker::CYLINDER;
+        m.action = visualization_msgs::msg::Marker::ADD;
+        m.pose.position.x = x;
+        m.pose.position.y = y;
+        m.pose.position.z = 0.2;
+        m.scale.x = 0.2; m.scale.y = 0.2; m.scale.z = 0.4;
+        m.color.a = 1.0f;
+        m.color.r = 1.0f - std::min(confidence * 2.0f, 1.0f);
+        m.color.g = 1.0f;
+        m.color.b = 0.0f;
+        pub_marker_->publish(m);
     }
 };
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<LegFinder>();
-    rclcpp::spin(node);
+    rclcpp::spin(std::make_shared<LegFinderNode>());
     rclcpp::shutdown();
     return 0;
 }

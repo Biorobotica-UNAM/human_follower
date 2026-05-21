@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -35,6 +36,7 @@ ament_target_dependencies(leg_finder_node
   tf2_ros
   tf2_eigen
   Eigen3
+  diagnostic_msgs
 )
 
 ament_target_dependencies(leg_finder_nodev2
@@ -46,6 +48,8 @@ ament_target_dependencies(leg_finder_nodev2
   tf2_ros
   tf2_eigen
   Eigen3
+  diagnostic_msgs
+  
 )
 
 ament_target_dependencies(human_follower_node
