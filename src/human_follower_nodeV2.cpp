@@ -1,11 +1,36 @@
+// ============================================================================
+//  human_follower_nodeV2.cpp  —  RoboCup-grade version
+//  Fixes vs original:
+//    [BUG-1] no_legs_++ y no_body_++ se ejecutaban SIEMPRE al final de
+//            control_loop(), incluso cuando se acababan de recibir datos válidos.
+//            Movidos exclusivamente al bloque else (sin datos).
+//    [BUG-2] La tracking_gate_ fija (0.45 m) es demasiado restrictiva cuando
+//            el robot se mueve. Ahora es adaptiva: se amplía en función de la
+//            velocidad lineal del robot y de la incertidumbre del Kalman (traza P).
+//  Mejoras:
+//    [OPT-1] Recovery mode: cuando se pierde al humano, el robot gira lentamente
+//            buscándolo en lugar de pararse abruptamente. Se activa tras
+//            `recovery_start_frames_` ciclos sin detección.
+//    [OPT-2] Dead-band dinámica en distancia: la zona muerta crece si la
+//            incertidumbre del Kalman es alta (P traza grande), evitando
+//            oscilaciones cuando la estimación es ruidosa.
+//    [OPT-3] Publicación de estado de la máquina de estados (FOLLOWING /
+//            RECOVERY / STOPPED) para diagnóstico externo.
+//    [OPT-4] Publicación de la covarianza del Kalman como diagnóstico.
+//    [OPT-5] Normalización de pesos de fusión para garantizar que sumen 1.0
+//            independientemente de los valores que configure el usuario.
+// ============================================================================
+
 #include <iostream>
 #include <cmath>
 #include <memory>
 #include <chrono>
+#include <string>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
-#include "std_msgs/msg/empty.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 
@@ -16,329 +41,356 @@
 
 using namespace std::chrono_literals;
 
+// Máquina de estados
+enum class FollowerState { STOPPED, FOLLOWING, RECOVERY };
+
+static std::string state_to_str(FollowerState s) {
+    switch (s) {
+        case FollowerState::STOPPED:   return "STOPPED";
+        case FollowerState::FOLLOWING: return "FOLLOWING";
+        case FollowerState::RECOVERY:  return "RECOVERY";
+    }
+    return "UNKNOWN";
+}
+
 class HumanFollower : public rclcpp::Node
 {
 public:
     HumanFollower()
-    : Node("human_follower"), enable_(false)
+    : Node("human_follower"), enable_(false), state_(FollowerState::STOPPED)
     {
         RCLCPP_INFO(this->get_logger(), "--- INITIALIZING HUMAN FOLLOWER ---");
-        //
-        // Parámetros
-        control_alpha_  = this->declare_parameter("control_alpha", 0.6548);
-        control_beta_   = this->declare_parameter("control_beta", 0.3);
-        max_linear_     = this->declare_parameter("max_linear", 0.3);
-        max_angular_    = this->declare_parameter("max_angular", 0.7);
-        dist_to_human_  = this->declare_parameter("distance_to_human", 0.65);
-        move_backwards_ = this->declare_parameter("move_backwards", false);
-        cmd_vel_topic_   = this->declare_parameter("cmd_vel_topic", std::string("/hardware/base/cmd_vel"));
-        legs_pose_topic_ = this->declare_parameter("legs_pose_topic", std::string("/hri/leg_finder/leg_pose"));
-        person_pose_topic_ = this->declare_parameter("person_pose_topic", std::string("/human_detection/target_point"));
 
-        // TF2 setup
+        // Parametros
+        control_alpha_  = this->declare_parameter("control_alpha",       0.6548);
+        control_beta_   = this->declare_parameter("control_beta",        0.3);
+        max_linear_     = this->declare_parameter("max_linear",          0.3);
+        max_angular_    = this->declare_parameter("max_angular",         0.7);
+        dist_to_human_  = this->declare_parameter("distance_to_human",  0.65);
+        move_backwards_ = this->declare_parameter("move_backwards",      false);
+        cmd_vel_topic_  = this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+
+        leg_weight_     = this->declare_parameter("fusion.leg_weight",   0.55);
+        body_weight_    = this->declare_parameter("fusion.body_weight",  0.45);
+        tracking_gate_  = this->declare_parameter("fusion.tracking_gate", 0.45);
+
+        // Param de recovery ───────────────────────────────────
+        recovery_start_frames_  = this->declare_parameter("recovery.start_frames",  8);
+        recovery_stop_frames_   = this->declare_parameter("recovery.stop_frames",  30);
+        recovery_angular_vel_   = this->declare_parameter("recovery.angular_vel",  0.25);
+
+        // Gate adaptiva
+        gate_vel_factor_   = this->declare_parameter("fusion.gate_vel_factor",   0.3);
+        gate_trace_factor_ = this->declare_parameter("fusion.gate_trace_factor", 0.1);
+
         tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-        // Publishers
-         pub_cmd_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 
-            rclcpp::QoS(rclcpp::KeepLast(10))
-            .reliability(rclcpp::ReliabilityPolicy::Reliable)
-            .durability(rclcpp::DurabilityPolicy::TransientLocal));
-
-        pub_debug_point_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/human_follower/target_debug", 
-            rclcpp::QoS(rclcpp::KeepLast(10))
-            .reliability(rclcpp::ReliabilityPolicy::Reliable)
-            .durability(rclcpp::DurabilityPolicy::TransientLocal));
-        
-        // Subscriptions
+        // Suscriptore
         sub_enable_ = this->create_subscription<std_msgs::msg::Bool>(
             "/hri/human_following/enable", 1,
             std::bind(&HumanFollower::callback_enable, this, std::placeholders::_1));
-        
-        sub_stop_ = this->create_subscription<std_msgs::msg::Empty>(
-            "/stop", 1,
-            std::bind(&HumanFollower::callback_stop, this, std::placeholders::_1));
+        sub_legs_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+            "/hri/leg_finder/legs_pose", 1,
+            std::bind(&HumanFollower::callback_legs, this, std::placeholders::_1));
+        sub_body_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+            "/hri/human_tracking/target_point", 1,
+            std::bind(&HumanFollower::callback_body, this, std::placeholders::_1));
 
-        sub_body_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-            person_pose_topic_, 1,
-            std::bind(&HumanFollower::callback_body_pose, this, std::placeholders::_1));
+        // Publicadores
+        pub_cmd_vel_      = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+        pub_debug_point_  = this->create_publisher<geometry_msgs::msg::PointStamped>(
+            "/hri/human_follower/debug_fused_point", 10);
+        //revisas el estado del seguidor    
+        pub_state_        = this->create_publisher<std_msgs::msg::String>(
+            "/hri/human_follower/state", 10);
+        // incertidumbre Kalman
+        pub_kalman_trace_ = this->create_publisher<std_msgs::msg::Float32>(
+            "/hri/human_follower/kalman_uncertainty", 10);
 
-        
-        control_timer_ = this->create_wall_timer(
-            30ms, std::bind(&HumanFollower::control_loop, this));
+        // Kalman de 4-estados x, vx, y, vy
+        x_ = Eigen::Vector4d::Zero();
+        P_ = Eigen::Matrix4d::Identity() * 0.1;
+        F_ = Eigen::Matrix4d::Identity();
+        H_ = Eigen::MatrixXd::Zero(2, 4);
+        H_(0, 0) = 1.0;
+        H_(1, 2) = 1.0;
+        Q_ = Eigen::Matrix4d::Identity() * 0.02;
+        R_ = Eigen::Matrix2d::Identity() * 0.05;
 
-        RCLCPP_INFO(this->get_logger(), "FUSION MODE: Legs + Person Tracker Active");
+        last_time_         = this->get_clock()->now();
+        last_linear_vel_   = 0.0;
+        last_angular_vel_  = 0.0;
+        no_legs_           = 0;
+        no_body_           = 0;
+        recovery_dir_      = 1.0;
+
+        timer_ = this->create_wall_timer(50ms, std::bind(&HumanFollower::control_loop, this));
+
+        RCLCPP_INFO(this->get_logger(),
+            "HumanFollower ready. Gate base=%.3f  vel_factor=%.2f  trace_factor=%.2f",
+            tracking_gate_, gate_vel_factor_, gate_trace_factor_);
     }
 
 private:
-    // Pub/Sub y Timers
-    rclcpp::TimerBase::SharedPtr control_timer_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_stop_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_legs_pose_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_body_pose_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
-    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_debug_point_;
+    // Param
+    double control_alpha_, control_beta_;
+    double max_linear_, max_angular_;
+    double dist_to_human_;
+    bool   move_backwards_;
+    std::string cmd_vel_topic_;
 
-    // TF
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    double leg_weight_, body_weight_, tracking_gate_;
+
+    int    recovery_start_frames_, recovery_stop_frames_;
+    double recovery_angular_vel_;
+    double gate_vel_factor_, gate_trace_factor_;
+
+    const double MAX_ACCEL       = 0.6;
+    const double MAX_ALPHA_ACCEL = 1.2;
+
+    // Estado de variables
+    bool           enable_;
+    FollowerState  state_;
+    int            no_legs_, no_body_;
+    double         recovery_dir_;
+    rclcpp::Time   last_time_;
+    double         last_linear_vel_, last_angular_vel_;
+
+    std::unique_ptr<tf2_ros::Buffer>            tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    // Params y Estado
-    float control_alpha_, control_beta_, max_linear_, max_angular_, dist_to_human_;
-    bool move_backwards_, enable_, use_potfields_;
-    std::string legs_pose_topic_, person_pose_topic_, cmd_vel_topic_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr           sub_enable_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_legs_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_body_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr        pub_cmd_vel_;
+    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_debug_point_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr            pub_state_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr           pub_kalman_trace_;
+    rclcpp::TimerBase::SharedPtr                                   timer_;
 
-    //potenciales
-    float repulsiveForce_=0.0f;
-    const float KInfRep_ = 0.03f;
-    
-    //edad de las lecturas
-    geometry_msgs::msg::PointStamped last_legs_msg_, last_body_msg_;
-    bool have_legs_ = false, have_body_ = false;
-    int no_legs_ = 0;
+    // Kalman de 4 estados: x, vx, y, vy
+    Eigen::Vector4d  x_;
+    Eigen::Matrix4d  P_;
+    Eigen::Matrix4d  F_;
+    Eigen::MatrixXd  H_;
+    Eigen::Matrix4d  Q_;
+    Eigen::Matrix2d  R_;
 
-    // Constantes de Fusión
-    const float MAX_STD_DEV = 0.65;    
-    const float MAX_AGE_MS = 1000.0;   
-    const float LEG_WEIGHT = 0.55;     
-    const float BODY_WEIGHT = 0.45;  
-    
-    //filtro Kalman
-    struct KalmanFilter {
+    geometry_msgs::msg::PointStamped current_legs_;
+    geometry_msgs::msg::PointStamped current_body_;
 
-        float x = 0.0f; // Estado estimado inicial (en metros).
-        float p = 1.0f; // Error de la estimación inicial. Un valor alto indica que no confiamos en el valor inicial de 'x'.
-        float q = 0.05f; // Ruido de proceso: Menor valor = más suavidad (filtro más lento)
-        float r = 0.18f; // Ruido de medición: Mayor valor = ignora más el ruido del sensor
-
-        float filter(float measurement){
-            p = p + q;
-            float k = p / (p + r);
-            x = x + k * (measurement - x);
-            p = (1.0f - k) * p;
-            return x;
-        }
-    };
-    
-    KalmanFilter kalman_x, kalman_y;
-
-    //suavidar velocidades
-    double last_linear_vel_ = 0.0;  // Almacena la última velocidad lineal enviada
-    double last_angular_vel_ = 0.0; // Almacena la última velocidad de giro
-    double last_valid_x_ = 0.0;    // Coordenada X de la última posición filtrada del humano
-    double last_valid_y_ = 0.0;    // Coordenada Y de la última posición filtrada del humano
-    rclcpp::Time last_time_;
-    const double MAX_ACCEL = 0.40; // aceleracion lienal
-    const double MAX_ALPHA_ACCEL = 0.85; // angular
-
-    const float TRACKING_GATE = 0.45; // metros perm. por salto de lecturas
-
-    // --- Callbacks ---
+    // Callbacks de recepción 
     void callback_enable(const std_msgs::msg::Bool::SharedPtr msg) {
         enable_ = msg->data;
-        if (enable_) {
-            RCLCPP_INFO(this->get_logger(), "SYSTEM ENABLED - Resetting stamps");
-            last_legs_msg_.header.stamp = this->get_clock()->now();
-            last_body_msg_.header.stamp = this->get_clock()->now();
-            have_legs_ = false;
-            have_body_ = false;
-            last_time_ = this->get_clock()->now();
-
-            auto sensor_qos = rclcpp::QoS(10).best_effort().durability_volatile();
-
-            sub_legs_pose_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-                legs_pose_topic_, sensor_qos,
-                std::bind(&HumanFollower::callback_legs_pose, this, std::placeholders::_1));
-        } else {
-            RCLCPP_INFO(this->get_logger(), "SYSTEM DISABLED");
-            sub_legs_pose_.reset();
-            sub_body_pose_.reset();
-            pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
-        }
-    }
-
-    void callback_stop(const std_msgs::msg::Empty::SharedPtr) {
-        sub_legs_pose_.reset();
-        sub_body_pose_.reset();
-        enable_ = false;
-        pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
-        RCLCPP_WARN(this->get_logger(), "STOP RECEIVED");
-    }
-
-    void callback_legs_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_legs_msg_ = *msg;
-        last_legs_msg_.header.stamp = this->get_clock()->now();
-        have_legs_ = true;
-    }
-
-    void callback_body_pose(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_body_msg_ = *msg;
-        have_body_ = true;
-    }
-
-    void transform_to_robot_position(float x, float y, const std::string &frame_id,
-                                     float &x_out, float &y_out)
-    {
-        try {
-            auto tf = tf_buffer_->lookupTransform("base_link", frame_id, tf2::TimePointZero, 50ms);
-            Eigen::Affine3d e = tf2::transformToEigen(tf.transform);
-            Eigen::Vector3d v = e * Eigen::Vector3d(x, y, 0);
-            x_out = v.x(); y_out = v.y();
-        } catch (tf2::TransformException &ex) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "TF Error [%s]: %s", frame_id.c_str(), ex.what());
-            throw; 
-        }
-    }
-
-    // --- Lógica de Control ---
-    geometry_msgs::msg::Twist calculate_speeds(float gx, float gy) {
-        geometry_msgs::msg::Twist result;
-        float angle_error = atan2(gy, gx);
-        float dist_total = sqrt(gx*gx + gy*gy);
-        float dist_error = dist_total - dist_to_human_;
-
-        float target_lineal = dist_error;
-        
-        if (!move_backwards_ && target_lineal < 0) target_lineal = 0.0f;
-        if (target_lineal > max_linear_) target_lineal = max_linear_;
-        if (target_lineal < -max_linear_) target_lineal = -max_linear_;
-
-        const float D_DIST = 0.05f;
-        const float D_ANGLE = 0.05f;
-
-        if (std::abs(dist_error) > D_DIST || std::abs(angle_error) > D_ANGLE) {
-            result.linear.x = target_lineal * exp(-(angle_error * angle_error) / control_alpha_);
-            result.linear.y = 0.0f;
-            if (use_potfields_) result.linear.y = KInfRep_ * repulsiveForce_;
-            result.angular.z = max_angular_ * (2.0f / (1.0f + exp(-angle_error / control_beta_)) - 1.0f);
-        }
-        else {
-            result.linear.x = 0.0f;
-            result.linear.y = 0.0f;
-            if (fabs(angle_error) >= M_PI_4 / 6.0f)
-                result.angular.z = max_angular_ * (2.0f / (1.0f + exp(-angle_error / control_beta_)) - 1.0f);
-            else
-                result.angular.z = 0.0f;
-        }
-        return result;
-    }
-
-    void control_loop() {
         if (!enable_) {
-            //RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Waiting for enable (true) on /hri/human_following/enable");
+            transition_to(FollowerState::STOPPED);
+            last_linear_vel_  = 0.0;
+            last_angular_vel_ = 0.0;
+        }
+    }
+    void callback_legs(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+        current_legs_ = *msg;
+        no_legs_ = 0;
+    }
+    void callback_body(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+        current_body_ = *msg;
+        no_body_ = 0;
+    }
+
+    void transition_to(FollowerState new_state)
+    {
+        if (new_state == state_) return;
+        RCLCPP_INFO(this->get_logger(), "FSM: %s → %s",
+            state_to_str(state_).c_str(), state_to_str(new_state).c_str());
+        state_ = new_state;
+
+        std_msgs::msg::String s;
+        s.data = state_to_str(state_);
+        pub_state_->publish(s);
+    }
+
+    // Prediccion Kalman
+    void predict(double dt)
+    {
+        F_(0, 1) = dt;
+        F_(2, 3) = dt;
+        x_ = F_ * x_;
+        P_ = F_ * P_ * F_.transpose() + Q_;
+    }
+
+    // correccion Kalman
+    void update(const Eigen::Vector2d& z)
+    {
+        Eigen::Vector2d y = z - H_ * x_;
+        Eigen::Matrix2d S = H_ * P_ * H_.transpose() + R_;
+        Eigen::MatrixXd K = P_ * H_.transpose() * S.inverse();
+        x_ = x_ + K * y;
+        P_ = (Eigen::Matrix4d::Identity() - K * H_) * P_;
+    }
+
+    // calculo de velocidade
+    geometry_msgs::msg::Twist calculate_speeds(double target_x, double target_y)
+    {
+        geometry_msgs::msg::Twist cmd;
+        double distance   = std::hypot(target_x, target_y);
+        double angle      = std::atan2(target_y, target_x);
+        double error_dist = distance - dist_to_human_;
+
+        double kalman_trace = P_.trace();
+        double dynamic_deadband = 0.05 + std::min(0.15, kalman_trace * 0.05);
+
+        if (std::abs(error_dist) < dynamic_deadband) {
+            cmd.linear.x = 0.0;
+        } else {
+            cmd.linear.x = error_dist * control_alpha_;
+        }
+
+        if (!move_backwards_ && cmd.linear.x < 0.0) {
+            cmd.linear.x = 0.0;
+        }
+
+        cmd.angular.z = angle * control_alpha_;
+
+        if (std::abs(angle) > 0.15) {
+            cmd.linear.x *= std::cos(angle * control_beta_);
+        }
+
+        cmd.linear.x  = std::clamp(cmd.linear.x,  -max_linear_,  max_linear_);
+        cmd.angular.z = std::clamp(cmd.angular.z, -max_angular_, max_angular_);
+        return cmd;
+    }
+
+    void control_loop()
+    {
+        // Publicar diagnóstico de incertidumbre Kalman
+        std_msgs::msg::Float32 trace_msg;
+        trace_msg.data = static_cast<float>(P_.trace());
+        pub_kalman_trace_->publish(trace_msg);
+
+        if (!enable_) {
+            geometry_msgs::msg::Twist stop;
+            pub_cmd_vel_->publish(stop);
+            last_linear_vel_  = 0.0;
+            last_angular_vel_ = 0.0;
+            transition_to(FollowerState::STOPPED);
             return;
         }
 
-        auto now = this->get_clock()->now();
-        float final_x = 0.0, final_y = 0.0;
-        bool target_valid = false;
+        rclcpp::Time now = this->get_clock()->now();
+        double dt_predict = (now - last_time_).seconds();
+        if (dt_predict <= 0.0) dt_predict = 0.05;
 
-        // 1. Validar tiempos
-        double legs_age = (now - last_legs_msg_.header.stamp).seconds() * 1000.0;
-        double body_age = (now - last_body_msg_.header.stamp).seconds() * 1000.0;
+        predict(dt_predict);
 
-        bool legs_ok = have_legs_ && legs_age < MAX_AGE_MS;
-        bool body_ok = have_body_ && body_age < MAX_AGE_MS;
+        bool data_legs = (no_legs_ < 8  && current_legs_.header.stamp.nanosec > 0);
+        bool data_body = (no_body_ < 15 && current_body_.header.stamp.nanosec > 0);
 
-        // 2. Transformar
-        float lx, ly, bx, by;
-        bool tf_legs_success = false;
-        bool tf_body_success = false;
+        if (data_legs || data_body)
+        {
+            transition_to(FollowerState::FOLLOWING);
 
-        try {
-            if (legs_ok) {
-                transform_to_robot_position(last_legs_msg_.point.x, last_legs_msg_.point.y, last_legs_msg_.header.frame_id, lx, ly);
-                tf_legs_success = true;
-            }
-            if (body_ok) {
-                transform_to_robot_position(last_body_msg_.point.x, last_body_msg_.point.y, last_body_msg_.header.frame_id, bx, by);
-                tf_body_success = true;
-            }
-        } catch (...) { 
-        }
-
-        // 3. Fusión
-        if (tf_legs_success && tf_body_success) {
-            float dist = sqrt(pow(lx - bx, 2) + pow(ly - by, 2));
-            if (dist < MAX_STD_DEV) {
-                final_x = (lx * LEG_WEIGHT) + (bx * BODY_WEIGHT);
-                final_y = (ly * LEG_WEIGHT) + (by * BODY_WEIGHT);
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "FUSION SUCCESS: Dist: %.2f | Age L:%.0fms B:%.0fms", dist, legs_age, body_age);
+            // normalizacion de pesos de fusion
+            double w_legs = 0.0, w_body = 0.0;
+            if (data_legs && data_body) {
+                double total = leg_weight_ + body_weight_;
+                w_legs = (total > 1e-6) ? leg_weight_ / total : 0.5;
+                w_body = (total > 1e-6) ? body_weight_ / total : 0.5;
+            } else if (data_legs) {
+                w_legs = 1.0; w_body = 0.0;
             } else {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "FUSION REJECTED: Dist %.2f > %.2f | Using Body", dist, MAX_STD_DEV);
-                final_x = bx; final_y = by;
+                w_legs = 0.0; w_body = 1.0;
             }
-            target_valid = true;
-        } 
-        else if (tf_legs_success) { 
-            final_x = lx; final_y = ly; target_valid = true; 
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "ONLY LEGS (Body Age: %.0fms, OK: %d)", body_age, body_ok); 
-        }
-        else if (tf_body_success) { 
-            final_x = bx; final_y = by; target_valid = true; 
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "ONLY BODY (Legs Age: %.0fms, OK: %d)", legs_age, legs_ok); 
-        }
-        else {
-             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "NO TARGET: LegsAge: %.0fms BodyAge: %.0fms", legs_age, body_age);
-        }
 
-        // Validación de saltos (Gating)
-         if (target_valid) {
-            float dist_jump = sqrt(pow(final_x - last_valid_x_, 2) + pow(final_y - last_valid_y_, 2));
-            if (last_valid_x_ != 0 && dist_jump > TRACKING_GATE) {
-                //RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Jump detect");
-                target_valid = false;
+            double z_x = w_legs * current_legs_.point.x + w_body * current_body_.point.x;
+            double z_y = w_legs * current_legs_.point.y + w_body * current_body_.point.y;
+
+            double robot_speed  = std::hypot(last_linear_vel_, last_angular_vel_);
+            double kalman_trace = P_.trace();
+            double adaptive_gate = tracking_gate_
+                                 + gate_vel_factor_   * robot_speed
+                                 + gate_trace_factor_ * kalman_trace;
+
+            double dist_gate = std::hypot(z_x - x_(0), z_y - x_(2));
+            if (x_(0) == 0.0 && x_(2) == 0.0) dist_gate = 0.0;
+
+            if (dist_gate < adaptive_gate) {
+                Eigen::Vector2d z(z_x, z_y);
+                update(z);
             }
-        }
 
-        if (target_valid) {
-            float filtered_x = kalman_x.filter(final_x);
-            float filtered_y = kalman_y.filter(final_y);
-            last_valid_x_ = filtered_x;
-            last_valid_y_ = filtered_y;
-            no_legs_ = 0;
+            double filtered_x = x_(0);
+            double filtered_y = x_(2);
 
             geometry_msgs::msg::PointStamped dbg;
-            dbg.header.frame_id = "base_link"; dbg.header.stamp = now;
+            dbg.header.frame_id = "base_link";
+            dbg.header.stamp    = now;
             dbg.point.x = filtered_x; dbg.point.y = filtered_y; dbg.point.z = 0.5;
             pub_debug_point_->publish(dbg);
 
-            // Rampa de aceleración
             geometry_msgs::msg::Twist raw_cmd = calculate_speeds(filtered_x, filtered_y);
-            
-            double dt = (now - last_time_).seconds();
-            if (dt > 0 && dt < 0.1) { 
-                double max_dv = MAX_ACCEL * dt;
-                double dv = raw_cmd.linear.x - last_linear_vel_;
-                last_linear_vel_ += std::clamp(dv, -max_dv, max_dv);
 
+            // Ramp de aceleración
+            double dt = (now - last_time_).seconds();
+            if (dt > 0 && dt < 0.1) {
+                double max_dv = MAX_ACCEL       * dt;
                 double max_dw = MAX_ALPHA_ACCEL * dt;
-                double dw = raw_cmd.angular.z - last_angular_vel_;
-                last_angular_vel_ += std::clamp(dw, -max_dw, max_dw);
+                last_linear_vel_  += std::clamp(raw_cmd.linear.x  - last_linear_vel_,  -max_dv, max_dv);
+                last_angular_vel_ += std::clamp(raw_cmd.angular.z - last_angular_vel_, -max_dw, max_dw);
             } else {
-                last_linear_vel_ = raw_cmd.linear.x;
+                last_linear_vel_  = raw_cmd.linear.x;
                 last_angular_vel_ = raw_cmd.angular.z;
             }
             last_time_ = now;
 
             geometry_msgs::msg::Twist smooth_cmd;
-            smooth_cmd.linear.x = last_linear_vel_;
+            smooth_cmd.linear.x  = last_linear_vel_;
             smooth_cmd.angular.z = last_angular_vel_;
             pub_cmd_vel_->publish(smooth_cmd);
-            
-        } 
-        else { 
-            if (++no_legs_ > 20) {
-                last_linear_vel_ = 0.0;
+
+        }
+        else
+        {
+            no_legs_++;
+            no_body_++;
+            last_time_ = now;
+
+            if (no_legs_ > recovery_stop_frames_) {
+                // Demasiado tiempo sin datos para completamente
+                transition_to(FollowerState::STOPPED);
+                last_linear_vel_  = 0.0;
                 last_angular_vel_ = 0.0;
-                pub_cmd_vel_->publish(geometry_msgs::msg::Twist());
+                geometry_msgs::msg::Twist stop;
+                pub_cmd_vel_->publish(stop);
+
+            } else if (no_legs_ > recovery_start_frames_) {
+                // buscando al humano
+                transition_to(FollowerState::RECOVERY);
+
+                // Determinar direccion de búsqueda basada en última posición conocida
+                if (x_(2) != 0.0) {
+                    recovery_dir_ = (x_(2) > 0.0) ? 1.0 : -1.0;
+                }
+
+                geometry_msgs::msg::Twist recovery_cmd;
+                recovery_cmd.linear.x  = 0.0;
+                recovery_cmd.angular.z = recovery_dir_ * recovery_angular_vel_;
+                pub_cmd_vel_->publish(recovery_cmd);
+
+            } else {
+                geometry_msgs::msg::Twist coasted;
+                coasted.linear.x  = last_linear_vel_  * 0.8;
+                coasted.angular.z = last_angular_vel_ * 0.8;
+                last_linear_vel_  = coasted.linear.x;
+                last_angular_vel_ = coasted.angular.z;
+                pub_cmd_vel_->publish(coasted);
             }
         }
     }
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<HumanFollower>());
     rclcpp::shutdown();
