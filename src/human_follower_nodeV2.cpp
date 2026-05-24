@@ -151,6 +151,9 @@ private:
 
     // Estado de variables
     bool           enable_;
+    // When disabled, publish one stop command and then stay silent so
+    // navigation, align and point can own /hardware/base/cmd_vel.
+    bool           disabled_stop_published_{false};
     FollowerState  state_;
     int            no_legs_, no_body_;
     double         recovery_dir_;
@@ -183,10 +186,13 @@ private:
     // Callbacks de recepción 
     void callback_enable(const std_msgs::msg::Bool::SharedPtr msg) {
         enable_ = msg->data;
-        if (!enable_) {
+        if (enable_) {
+            disabled_stop_published_ = false;
+        } else {
             transition_to(FollowerState::STOPPED);
             last_linear_vel_  = 0.0;
             last_angular_vel_ = 0.0;
+            publish_disabled_stop_once();
         }
     }
     void callback_legs(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
@@ -208,6 +214,16 @@ private:
         std_msgs::msg::String s;
         s.data = state_to_str(state_);
         pub_state_->publish(s);
+    }
+
+    void publish_disabled_stop_once()
+    {
+        if (disabled_stop_published_) return;
+        // Send a single brake command on disable without fighting other
+        // base controllers with repeated zero twists.
+        geometry_msgs::msg::Twist stop;
+        pub_cmd_vel_->publish(stop);
+        disabled_stop_published_ = true;
     }
 
     // Prediccion Kalman
@@ -269,8 +285,7 @@ private:
         pub_kalman_trace_->publish(trace_msg);
 
         if (!enable_) {
-            geometry_msgs::msg::Twist stop;
-            pub_cmd_vel_->publish(stop);
+            publish_disabled_stop_once();
             last_linear_vel_  = 0.0;
             last_angular_vel_ = 0.0;
             transition_to(FollowerState::STOPPED);
