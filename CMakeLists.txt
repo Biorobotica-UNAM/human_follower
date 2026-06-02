@@ -17,6 +17,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 #v1
 add_executable(leg_finder_node src/leg_finder_node.cpp)
@@ -37,6 +38,7 @@ ament_target_dependencies(leg_finder_node
   tf2_eigen
   Eigen3
   diagnostic_msgs
+  tf2_geometry_msgs
 )
 
 ament_target_dependencies(leg_finder_nodev2
@@ -49,6 +51,7 @@ ament_target_dependencies(leg_finder_nodev2
   tf2_eigen
   Eigen3
   diagnostic_msgs
+  tf2_geometry_msgs
   
 )
 
@@ -61,6 +64,7 @@ ament_target_dependencies(human_follower_node
   tf2_ros
   tf2_eigen
   Eigen3
+  tf2_geometry_msgs
 )
 
 ament_target_dependencies(human_follower_nodeV2
@@ -72,12 +76,14 @@ ament_target_dependencies(human_follower_nodeV2
   tf2_ros
   tf2_eigen
   Eigen3
+  tf2_geometry_msgs
 )
 
 ament_target_dependencies(human_tracking_node
   rclcpp
   std_msgs
   std_srvs
+  tf2_geometry_msgs
 )
 
 install(TARGETS 
