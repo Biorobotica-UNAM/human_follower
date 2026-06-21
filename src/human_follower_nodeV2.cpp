@@ -5,6 +5,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/empty.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
@@ -22,8 +23,8 @@ enum class FollowerState { STOPPED, FOLLOWING };
 class HumanFollower : public rclcpp::Node
 {
 public:
-    HumanFollower() : Node("human_follower"), enable_(false), state_(FollowerState::STOPPED),
-                      kalman_initialized_(false)
+    HumanFollower() : Node("human_follower"), enable_(false), kalman_initialized_(false),
+                      state_(FollowerState::STOPPED)
     {
         RCLCPP_INFO(this->get_logger(), "--- INITIALIZING HUMAN FOLLOWER ---");
 
@@ -32,6 +33,7 @@ public:
         body_weight_   = this->declare_parameter("fusion.body_weight", 0.45);
         tracking_gate_ = this->declare_parameter("fusion.tracking_gate", 2.0); 
         goal_topic_    = this->declare_parameter<std::string>("goal_topic", "/nav_control/goal");
+        stop_topic_    = this->declare_parameter<std::string>("stop_topic", "/navigation/stop");
         global_frame_  = this->declare_parameter<std::string>("global_frame", "map");
         goal_min_dist_ = this->declare_parameter("goal_min_dist", 0.15); //  15-0.08 calibrar para la fluidez que se necesite
 
@@ -49,6 +51,7 @@ public:
             std::bind(&HumanFollower::cb_body, this, std::placeholders::_1));
 
         pub_goal_  = this->create_publisher<geometry_msgs::msg::PoseStamped>(goal_topic_, 10);
+        pub_stop_  = this->create_publisher<std_msgs::msg::Empty>(stop_topic_, 10);
         pub_state_ = this->create_publisher<std_msgs::msg::String>("/hri/human_follower/state", 10);
         pub_debug_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
             "/hri/human_follower/debug_fused_point", 10);
@@ -67,8 +70,8 @@ public:
         last_goal_x_ = last_goal_y_ = 0.0;
 
         timer_ = this->create_wall_timer(200ms, std::bind(&HumanFollower::control_loop, this)); // mas reactividad con 100-200ms 
-        RCLCPP_INFO(this->get_logger(), "HumanFollower ready. Goal → %s  dist=%.2f  gate=%.2f",
-            goal_topic_.c_str(), dist_to_human_, tracking_gate_);
+        RCLCPP_INFO(this->get_logger(), "HumanFollower ready. Goal → %s  stop → %s  dist=%.2f  gate=%.2f",
+            goal_topic_.c_str(), stop_topic_.c_str(), dist_to_human_, tracking_gate_);
     }
 
 private:
@@ -76,7 +79,7 @@ private:
     bool kalman_initialized_;
     FollowerState state_;
     double dist_to_human_, leg_weight_, body_weight_, tracking_gate_, goal_min_dist_;
-    std::string goal_topic_, global_frame_;
+    std::string goal_topic_, stop_topic_, global_frame_;
     int no_legs_, no_body_;
     rclcpp::Time last_time_;
     double last_goal_x_, last_goal_y_;
@@ -88,6 +91,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_legs_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_body_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr     pub_goal_;
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr                pub_stop_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr               pub_state_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr    pub_debug_;
     rclcpp::TimerBase::SharedPtr                                      timer_;
@@ -104,6 +108,8 @@ private:
         if (!enable_) {
             transition_to(FollowerState::STOPPED);
             kalman_reset();
+            pub_stop_->publish(std_msgs::msg::Empty{});
+            RCLCPP_INFO(this->get_logger(), "HumanFollower disabled; published navigation stop");
         } else {
             RCLCPP_INFO(this->get_logger(), "HumanFollower RE-ACTIVADO — buscando target...");
         }
