@@ -8,26 +8,20 @@
   <!-- Leg finder node -->
 
   <node pkg="human_follower" exec="leg_finder_node" name="leg_finder_node" output="screen">
-    <param name="laser_scan_topic" value="/hardware/base/scan"/>
-    <param name="laser_scan_frame" value="laser_link"/>
-    <param name="frame_id" value="base_link"/>
-    <param name="show_hypothesis" value="true"/>
-    <param name="serial_port" value="/dev/ttyACM0"/>
-    <param name="scan_downsample" value="1"/>
+    <param name="scan_topic" value="/hardware/base/scan"/>
+    <param name="base_frame" value="base_link"/>
+    <param name="legs_pose_topic" value="/hri/leg_finder/legs_pose"/>
   </node>
 
   <!-- Human follower node -->
 
   <node pkg="human_follower" exec="human_follower_nodeV2" name="human_follower_nodeV2" output="screen">
-    <param name="control_alpha" value="0.6548"/>
-    <param name="control_beta" value="0.3"/>
-    <param name="max_linear" value="0.3"/>
-    <param name="max_angular" value="0.7"/>
     <param name="distance_to_human" value="0.9"/>
-    <param name="move_backwards" value="false"/>
-    <param name="enable_potfields" value="false"/>
-    <param name="cmd_vel_topic" value="/hardware/base/cmd_vel"/>
-    <param name="person_pose_topic" value="/hardware/head/look_at"/>
+    <param name="goal_topic" value="/nav_control/goal"/>
+    <param name="stop_topic" value="/navigation/stop"/>
+    <param name="global_frame" value="map"/>
+    <param name="goal_min_dist" value="0.15"/>
+    <param name="point_timeout_s" value="0.8"/>
   </node>
 
   <!-- Pipeline handler node -->
